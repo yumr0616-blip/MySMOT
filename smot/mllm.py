@@ -1,11 +1,11 @@
-"""Frozen MLLM: Protocol + a real (deterministic) mock adapter for Stage-0.
+"""冻结 MLLM:Protocol 定义 + 一个"真材实料"的 Stage-0 mock 实现。
 
-Frozen per §4: no separate output head, generative, task distinguished by
-prompt. MockMLLMAdapter stands in for a real Qwen-VL-class model; it parses
-the structured ids that smot.prompts embeds into transcript_text (e.g.
-"track_id=3", "subject_id=1 ... object_id=2") and returns canned-but-genuine
-text built from those ids, so downstream OutputAssembler parsing is
-exercised for real rather than round-tripping a hardcoded string.
+对应 §4:MLLM 本身是冻结的,没有独立输出头,靠 prompt 区分任务、
+生成式地输出文本。MockMLLMAdapter 用来代替真实的 Qwen-VL 一类模型——
+它会真的从 smot.prompts 塞进 transcript_text 里的固定格式 id
+(比如 "track_id=3"、"subject_id=1 ... object_id=2")用正则解析出来,
+再拼出对应的"照本宣科"回复文本。这样下游的 OutputAssembler 解析逻辑
+是被真实地跑过一遍的,而不是简单地把写死的字符串原样传回去。
 """
 from __future__ import annotations
 
@@ -20,6 +20,10 @@ _OBJECT_ID_RE = re.compile(r"object_id=(\d+)")
 
 @dataclass(frozen=True)
 class MLLMRequest:
+    """发给 MLLM 的一次请求:任务类型 + transcript 文本(prompts.py
+    构造出的完整 prompt)+ 关键帧引用 + (Stage-0 恒为空的)soft token。
+    """
+
     prompt_type: str  # "instance" | "interaction" | "video"
     transcript_text: str
     frame_refs: tuple[int, ...]
@@ -28,17 +32,20 @@ class MLLMRequest:
 
 @runtime_checkable
 class MLLMAdapter(Protocol):
-    """Frozen."""
+    """冻结。"""
 
     def generate(self, request: MLLMRequest) -> str: ...
 
 
 class MockMLLMAdapter:
-    """Frozen (stub standing in for a real MLLM). Deterministic canned text
-    keyed off prompt_type, derived from ids embedded in transcript_text.
+    """冻结(用 mock 代替真实模型)。根据 prompt_type 分支,
+    从 transcript_text 里解析出对应的 id,拼出确定性但"看起来真实"
+    的回复文本。
     """
 
     def __init__(self, canned_responses: Optional[dict[str, str]] = None):
+        # 允许调用方按 prompt_type 直接注入固定回复,用于测试里绕过
+        # 正则解析、单独验证某个分支的行为。
         self._canned_responses = canned_responses or {}
 
     def generate(self, request: MLLMRequest) -> str:
@@ -55,6 +62,9 @@ class MockMLLMAdapter:
             obj = _OBJECT_ID_RE.search(request.transcript_text)
             subject_id = subj.group(1) if subj else "?"
             object_id = obj.group(1) if obj else "?"
+            # 固定用 "approaches" 这个谓词,它同时也在
+            # canonical_labels.CANONICAL_MAP 里有对应的规范化映射,
+            # 方便验证 Output Assembler 的谓词提取+规范化流程。
             return f"subject_id={subject_id} approaches object_id={object_id}."
 
         if request.prompt_type == "video":

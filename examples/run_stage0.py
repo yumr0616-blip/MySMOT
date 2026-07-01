@@ -1,10 +1,10 @@
-"""Runnable Stage-0 demo.
+"""可运行的 Stage-0 演示脚本。
 
-Builds a small synthetic two-object trajectory fixture, wires a fully
-default (Stage-0) Pipeline, runs it, and pretty-prints the resulting
-instance/interaction/video assertions as JSON.
+构造一个小的合成双目标轨迹 fixture,用全默认(Stage-0)配置组装一个
+Pipeline,跑一遍,把得到的 instance/interaction/video 断言以 JSON
+形式打印出来。
 
-Usage: python examples/run_stage0.py
+用法: python examples/run_stage0.py
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import json
 import os
 import sys
 
+# 让脚本无论从哪个工作目录运行,都能找到仓库根目录下的 smot 包。
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from smot.pipeline import Pipeline
@@ -20,9 +21,10 @@ from smot.types import FramePresence, Trajectory
 
 
 def _make_demo_trajectories() -> list[Trajectory]:
-    # Small inline fixture (duplicated from tests/fixtures.py by design, so
-    # examples/ has zero dependency on tests/): track 1 moves right and
-    # accelerates, ending adjacent to stationary track 2.
+    # 这里特意从 tests/fixtures.py 里内联复制了一份同样的 fixture
+    # (而不是 import tests 模块),是为了让 examples/ 目录不依赖 tests/
+    # 目录——两者各自独立,互不影响。
+    # track1 向右加速移动,最终与静止不动的 track2 发生框重叠。
     track1 = Trajectory(
         track_id=1,
         present=(0, 4),
@@ -44,6 +46,8 @@ def _make_demo_trajectories() -> list[Trajectory]:
 
 def main() -> None:
     trajectories = _make_demo_trajectories()
+    # StubTracker 直接把提前造好的轨迹原样返回,相当于"假装"这是
+    # 冻结 tracker 的输出结果。
     pipeline = Pipeline(tracker=StubTracker(trajectories))
     result = pipeline.run(VideoHandle(path="synthetic://two_object_demo", num_frames=5))
     print(json.dumps(result.to_json_dict(), indent=2))

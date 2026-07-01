@@ -1,8 +1,9 @@
-"""Frozen Tracker: Protocol + Stage-0 stub.
+"""冻结 Tracker:Protocol 定义 + Stage-0 占位实现。
 
-Frozen, not finetuned, per §4. Recommended real implementation is
-detector + SAM2 (matches the TF-SMOT baseline for a controlled comparison);
-that requires GPU + real models and is out of scope for this scaffold.
+对应 §4:冻结、不 finetune。推荐的真实实现是 detector + SAM2(与
+TF-SMOT 的基座保持一致,便于控制跟踪这个变量、公平对比);真实的
+detector+SAM2 需要 GPU 和模型权重,超出本脚手架范围,这里先用
+StubTracker 占位,只是把提前准备好的轨迹原样返回。
 """
 from __future__ import annotations
 
@@ -12,9 +13,9 @@ from smot.types import Trajectory
 
 
 class VideoHandle:
-    """Minimal stand-in for a decoded video reference. Never decodes real
-    frames in this scaffold; exists so Pipeline's call signature doesn't need
-    to change once a real Tracker is wired in.
+    """一个"视频引用"的最简占位对象。本脚手架里从不真正解码视频帧,
+    只是存一下路径/帧数/帧率这些元信息,好让 Pipeline 的调用签名
+    在未来接入真实视频解码时不需要修改。
     """
 
     def __init__(self, path: str, num_frames: int, fps: float = 1.0):
@@ -25,15 +26,15 @@ class VideoHandle:
 
 @runtime_checkable
 class Tracker(Protocol):
-    """Frozen. Not finetuned."""
+    """冻结,不 finetune。"""
 
     def track(self, video: VideoHandle) -> list[Trajectory]: ...
 
 
 class StubTracker:
-    """Frozen (stub). Returns a fixed/injected list[Trajectory] supplied at
-    construction time. A real detector+SAM2 tracker plugs in later behind the
-    same Protocol.
+    """冻结(占位实现)。构造时传入一份写死/预先算好的轨迹列表,
+    track() 调用时原样返回,不做任何真实的检测或跟踪计算。
+    未来真实的 detector+SAM2 tracker 会实现同一个 Tracker Protocol。
     """
 
     def __init__(self, canned_trajectories: Optional[list[Trajectory]] = None):

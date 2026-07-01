@@ -1,12 +1,14 @@
-"""Fact Selector: Protocol + Stage-0 deterministic implementation.
+"""Fact Selector:Protocol 定义 + Stage-0 确定性实现。
 
-Per §4/§6: fact VALUES are never learned (they come from the deterministic
-Motion Fact Extractor); only WHICH facts get selected into the transcript is
-learned, via a ride-along slot structurally isomorphic to KFA. Stage-0 has no
-learned slot yet, so DeterministicFactSelector picks facts by a fixed
-priority order and always returns soft_token=None. A Stage-1 learnable
-FactSelector implementation will satisfy this same Protocol, so Pipeline
-never needs to change.
+对应 §4/§6:事实的数值(value)永远不学习(由确定性的 Motion Fact
+Extractor 产出);学习的只是"该选哪些事实放进 transcript 文本"这件事,
+通过一个和 KFA 结构同构的 ride-along slot 来实现(soft+hard 双读出,
+hard 的离散选择搭 soft 读出的梯度便车)。
+
+Stage-0 阶段还没有真正的可学习 slot,所以 DeterministicFactSelector
+只是按一个固定的类型优先级顺序挑事实,soft_token 恒为 None。未来
+Stage-1 的可学习实现会实现同一个 FactSelector Protocol,因此 Pipeline
+的调用方式完全不需要改变。
 """
 from __future__ import annotations
 
@@ -18,12 +20,25 @@ from smot.types import FACT_TYPE_ORDER, Fact
 
 @dataclass(frozen=True)
 class SelectionContext:
-    scope: str  # "instance:<i>" | "pair:<i>,<j>" | "video"
+    """描述"在什么范围内选事实"的查询上下文。
+
+    scope 取值约定:
+      - "instance:<i>"  单个目标的事实
+      - "pair:<i>,<j>"  一对目标之间的事实
+      - "video"         整段视频级别(见 DeterministicFactSelector 里
+                         对这个特殊值的通配处理)
+    """
+
+    scope: str
     top_k: int = 8
 
 
 @dataclass(frozen=True)
 class FactSelection:
+    """一次选择的结果:选中的事实列表、(Stage-0 恒为 None 的)soft
+    token、以及渲染成文本后的 transcript。
+    """
+
     selected_facts: tuple[Fact, ...]
     soft_token: tuple[float, ...] | None
     text: str
@@ -35,12 +50,16 @@ class FactSelector(Protocol):
 
 
 def _render_fact(fact: Fact) -> str:
+    """把一条 Fact 渲染成一小段人类可读的文本,格式大致是
+    "<类型>[<范围>]=<值> (t=<起>..<止>)",作为最终塞进 MLLM prompt 里的
+    transcript 片段。
+    """
     return f"{fact.type.value}[{fact.scope}]={fact.value} (t={fact.t_span[0]}..{fact.t_span[1]})"
 
 
 class DeterministicFactSelector:
-    """Deterministic (not learned). Stage-0 default: selects up to top_k
-    facts in a fixed type-priority order, then renders them to text.
+    """确定性(不学习)。Stage-0 默认实现:按固定的类型优先级顺序,
+    从匹配 scope 的事实里挑最多 top_k 条,再渲染成文本。
     """
 
     def __init__(self, priority_order: tuple = FACT_TYPE_ORDER):
@@ -48,8 +67,8 @@ class DeterministicFactSelector:
 
     def select(self, facts: list[Fact], query_context: SelectionContext) -> FactSelection:
         if query_context.scope == "video":
-            # Video-level queries summarize over the whole fact pool rather
-            # than a single instance/pair scope.
+            # 视频级别的查询是对"全部事实池"做概括,而不是某一个具体的
+            # instance/pair scope,所以这里用全集而不是按 scope 过滤。
             scoped = list(facts)
         else:
             scoped = [f for f in facts if f.scope == query_context.scope]
@@ -58,6 +77,8 @@ class DeterministicFactSelector:
             try:
                 return self.priority_order.index(fact.type)
             except ValueError:
+                # 出现优先级列表里没有的类型时,排到最后而不是报错,
+                # 保证未来新增事实类型时不会破坏现有排序逻辑。
                 return len(self.priority_order)
 
         ordered = sorted(scoped, key=sort_key)
