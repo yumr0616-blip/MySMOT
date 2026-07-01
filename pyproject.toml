@@ -1,0 +1,19 @@
+[project]
+name = "smot"
+version = "0.0.1"
+description = "Semantic Multi-Object Tracking: learnable, compressible, attributable trajectory-to-language interface"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+# Introduced when real KFA/Projector/Fact-Selector slots need soft-token
+# injection via inputs_embeds (Stage-1a/1b, per design doc §9).
+ml = ["torch", "transformers"]
+
+[tool.setuptools.packages.find]
+include = ["smot*"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
