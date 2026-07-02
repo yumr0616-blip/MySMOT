@@ -30,6 +30,7 @@ from smot.datasets.bensmot import (
     sequence_to_video_handle,
 )
 from smot.eval import evaluate
+from smot.event_filter import EventCandidateFilter, adaptive_proximity_gate
 from smot.pipeline import Pipeline
 from smot.tracker import StubTracker
 
@@ -57,8 +58,17 @@ def main() -> int:
 
     preds: list[dict] = []
     for seq in sequences:
-        # GT 轨迹当作冻结 tracker 的输出;其余组件全部 Stage-0 默认值。
-        pipeline = Pipeline(tracker=StubTracker(list(seq.trajectories)))
+        trajectories = list(seq.trajectories)
+        # GT 轨迹当作冻结 tracker 的输出。事件过滤与真实脚本同配置
+        # (自适应邻近门限 + 邻近跳变触发),保证 Mock 基线与真实 MLLM
+        # 的成本/指标对比在同一候选集上进行;其余组件 Stage-0 默认值。
+        pipeline = Pipeline(
+            tracker=StubTracker(trajectories),
+            event_filter=EventCandidateFilter(
+                proximity_gate=adaptive_proximity_gate(trajectories),
+                proximity_trigger=True,
+            ),
+        )
         result = pipeline.run(sequence_to_video_handle(seq))
         payload = result.to_json_dict()
         payload["sequence"] = seq.name  # 与 gold 对齐的溯源键

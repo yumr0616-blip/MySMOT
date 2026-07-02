@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from smot.event_filter import EventCandidateFilter
+from smot.event_filter import EventCandidateFilter, adaptive_proximity_gate
 from smot.types import FramePresence, Trajectory
 from tests.fixtures import make_single_object_fixture, make_two_object_fixture
 
@@ -141,6 +141,90 @@ class TestEventCandidateFilterSingleObject(unittest.TestCase):
         trajectories = make_single_object_fixture()
         candidates = EventCandidateFilter().find_candidates(trajectories)
         self.assertEqual(candidates, [])
+
+
+def _static_traj(track_id: int, x: float, n: int = 5, size: float = 10.0) -> Trajectory:
+    return Trajectory(
+        track_id=track_id,
+        present=(0, n - 1),
+        per_frame=tuple(
+            FramePresence(t=t, box=(x, 0.0, x + size, size)) for t in range(n)
+        ),
+    )
+
+
+class TestProximityTrigger(unittest.TestCase):
+    """邻近状态跳变触发器(默认关闭,显式开启后覆盖交谈类无事件交互)。"""
+
+    def test_disabled_by_default_keeps_stage0_semantics(self):
+        # 两个静止目标始终相距 20(< 默认 gate 50):没有接触/突变/遮挡,
+        # 默认配置下不产生任何候选——Stage-0 行为保持不变。
+        trajectories = [_static_traj(1, 0.0), _static_traj(2, 20.0)]
+        self.assertEqual(EventCandidateFilter().find_candidates(trajectories), [])
+
+    def test_always_near_pair_triggers_on_first_common_frame(self):
+        # 开启后,全程贴在一起的一对(面对面交谈的抽象)在公共可见的
+        # 第一帧被点亮。
+        trajectories = [_static_traj(1, 0.0), _static_traj(2, 20.0)]
+        candidates = EventCandidateFilter(proximity_trigger=True).find_candidates(
+            trajectories
+        )
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].triggers, ("proximity",))
+        self.assertEqual(candidates[0].candidate_frames, (0,))
+
+    def test_transition_records_frames_on_both_sides(self):
+        # track1 逐帧靠近静止的 track2:距离 60, 45, 30(gate=50,
+        # 状态在第 0->1 帧之间翻转)-> 记录翻转前后两帧 (0, 1)。
+        track1 = Trajectory(
+            track_id=1,
+            present=(0, 2),
+            per_frame=(
+                FramePresence(t=0, box=(0.0, 0.0, 10.0, 10.0)),
+                FramePresence(t=1, box=(15.0, 0.0, 25.0, 10.0)),
+                FramePresence(t=2, box=(30.0, 0.0, 40.0, 10.0)),
+            ),
+        )
+        track2 = _static_traj(2, 60.0, n=3)
+        filt = EventCandidateFilter(proximity_trigger=True)
+        self.assertEqual(filt._proximity_transition_frames(track1, track2), [0, 1])
+
+    def test_far_pair_stays_silent(self):
+        trajectories = [_static_traj(1, 0.0), _static_traj(2, 500.0)]
+        candidates = EventCandidateFilter(proximity_trigger=True).find_candidates(
+            trajectories
+        )
+        self.assertEqual(candidates, [])
+
+
+class TestAdaptiveProximityGate(unittest.TestCase):
+    def test_scales_with_median_box_diagonal(self):
+        # 100x220 的"真人"框:对角线 ≈ 241.66,gate = 1.5 倍 ≈ 362.49。
+        # 混入的小框只有 1 个观测,4 个大框观测占多数 -> 中位数取大框。
+        trajectories = [
+            _static_traj(1, 0.0, n=1, size=1.0),  # 故意混入一个小框
+            Trajectory(
+                track_id=2,
+                present=(0, 1),
+                per_frame=tuple(
+                    FramePresence(t=t, box=(0.0, 0.0, 100.0, 220.0)) for t in range(2)
+                ),
+            ),
+            Trajectory(
+                track_id=3,
+                present=(0, 1),
+                per_frame=tuple(
+                    FramePresence(t=t, box=(0.0, 0.0, 100.0, 220.0)) for t in range(2)
+                ),
+            ),
+        ]
+        gate = adaptive_proximity_gate(trajectories)
+        self.assertAlmostEqual(gate, 1.5 * (100.0**2 + 220.0**2) ** 0.5, places=3)
+
+    def test_floor_applies_to_tiny_boxes_and_empty_input(self):
+        self.assertEqual(adaptive_proximity_gate([]), 50.0)
+        tiny = [_static_traj(1, 0.0, size=1.0)]
+        self.assertEqual(adaptive_proximity_gate(tiny), 50.0)
 
 
 if __name__ == "__main__":

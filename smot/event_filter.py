@@ -23,6 +23,28 @@ class EventCandidate:
     triggers: tuple[str, ...]
 
 
+def adaptive_proximity_gate(
+    trajectories: list[Trajectory], scale: float = 1.5, floor: float = 50.0
+) -> float:
+    """按目标尺寸自适应的邻近门控阈值:全体观测框对角线的中位数 × scale。
+
+    默认的 proximity_gate=50(绝对像素)隐含了小分辨率/小目标假设——
+    换到 1080p 的真人框,两人隔半个身位就会被判"不近",单目标突变全被
+    门控挡掉,交互召回率静默塌零(真实 BenSMOT 接入时踩到的坑)。
+    "近"的语义本质上是相对目标尺度的:以框对角线(人≈身高)为单位,
+    scale=1.5 即"一个半身位以内算近"。floor 兜底空轨迹/退化框。
+    """
+    diagonals = sorted(
+        math.hypot(fp.box[2] - fp.box[0], fp.box[3] - fp.box[1])
+        for traj in trajectories
+        for fp in traj.per_frame
+    )
+    if not diagonals:
+        return floor
+    median = diagonals[len(diagonals) // 2]
+    return max(scale * median, floor)
+
+
 class EventCandidateFilter:
     """启发式,不学习。产出候选边 + 触发帧,供 Pairwise KFA /
     交互断言构建使用。
@@ -34,6 +56,7 @@ class EventCandidateFilter:
         speed_change_ratio: float = 1.5,
         direction_change_deg: float = 45.0,
         proximity_gate: float = 50.0,
+        proximity_trigger: bool = False,
     ):
         self.contact_iou_threshold = contact_iou_threshold
         self.speed_change_ratio = speed_change_ratio
@@ -43,7 +66,13 @@ class EventCandidateFilter:
         # 用来避免 n 目标场景里一个目标的突变把它和其余 n-1 个目标的
         # 候选边全部点亮——每条候选边都是一次 MLLM 调用,§7 把调用次数
         # 列为一等公民成本指标,候选边爆炸会直接拉高成本基线。
+        # 真实数据上建议用 adaptive_proximity_gate() 按目标尺度取值。
         self.proximity_gate = proximity_gate
+        # 邻近状态跳变触发器(见 _proximity_transition_frames):覆盖
+        # "无接触、无速度/方向突变"的社交类交互(交谈、并肩……)。
+        # 默认关闭以保持 Stage-0 已核验的候选语义与成本地板不变;
+        # 接真实数据的脚本应显式开启。
+        self.proximity_trigger = proximity_trigger
 
     def _contact_frames(self, traj_i: Trajectory, traj_j: Trajectory) -> list[int]:
         """接触/重叠触发:两个目标的框在同一帧的 IoU 达到阈值,视为
@@ -161,6 +190,38 @@ class EventCandidateFilter:
                 )
         return sorted(triggered)
 
+    def _proximity_transition_frames(
+        self, traj_i: Trajectory, traj_j: Trajectory
+    ) -> list[int]:
+        """邻近状态跳变触发:两目标中心距离相对 proximity_gate 的"近/远"
+        状态发生翻转的时刻(走到一起 / 分开),记录翻转点前后各一帧
+        (与速度/方向突变同一约定);另外,公共可见的第一帧就已经"近"
+        时也记为触发帧——全程贴在一起的一对(如面对面交谈)从不发生
+        状态翻转,没有这一条它们永远成不了候选。
+
+        接触/突变/遮挡四类规则都要求某种"离散事件",而 BenSMOT 这类
+        数据里大量交互(交谈、对视、并肩同行)恰恰没有任何离散事件,
+        本触发器是它们的补集。语义上"近"本身就是门控,不需要再过
+        _pair_close_at。
+        """
+        common_ts = sorted(
+            {fp.t for fp in traj_i.per_frame} & {fp.t for fp in traj_j.per_frame}
+        )
+        if not common_ts:
+            return []
+        near = [
+            dist(centroid(traj_i.frame_at(t).box), centroid(traj_j.frame_at(t).box))
+            <= self.proximity_gate
+            for t in common_ts
+        ]
+        triggered: set[int] = set()
+        if near[0]:
+            triggered.add(common_ts[0])
+        for k in range(1, len(near)):
+            if near[k] != near[k - 1]:
+                triggered.update((common_ts[k - 1], common_ts[k]))
+        return sorted(triggered)
+
     def _pair_close_at(self, traj_i: Trajectory, traj_j: Trajectory, t: int) -> bool:
         """判断两个目标在帧 t 是否"离得足够近"(中心点距离不超过
         proximity_gate)。任意一方在该帧没有观测时返回 False——距离
@@ -203,6 +264,12 @@ class EventCandidateFilter:
                 if contact:
                     frames.update(contact)
                     triggers.append("contact")
+
+                if self.proximity_trigger:
+                    proximity = self._proximity_transition_frames(traj_i, traj_j)
+                    if proximity:
+                        frames.update(proximity)
+                        triggers.append("proximity")
 
                 # 只要这一对里任意一方发生了突变都算数(比如追逐场景里,
                 # 只有追的一方会突然加速),但必须通过邻近度门控。

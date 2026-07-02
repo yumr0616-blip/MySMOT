@@ -13,6 +13,7 @@ dev = ["pytest"]
 #   pip install torch --index-url https://download.pytorch.org/whl/cu128
 ml = [
     "torch",
+    "torchvision",  # Qwen3.5 的 processor(视频分支)依赖
     "transformers",
     "accelerate",
     "bitsandbytes",

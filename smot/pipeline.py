@@ -17,7 +17,7 @@ token 的真实 projector 接进来,token 立刻会到达 MLLM 适配器,
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Optional
+from typing import Callable, Optional, Sequence
 
 from smot.event_filter import EventCandidateFilter
 from smot.fact_selector import DeterministicFactSelector, FactSelector, SelectionContext
@@ -29,7 +29,7 @@ from smot.pair_features import build_pair_features
 from smot.projector import NoOpProjector, Projector
 from smot.prompts import build_instance_prompt, build_interaction_prompt, build_video_prompt
 from smot.tracker import Tracker, VideoHandle
-from smot.types import Fact, InstanceAssertion, InteractionAssertion, VideoAssertion
+from smot.types import Fact, InstanceAssertion, InteractionAssertion, Trajectory, VideoAssertion
 
 
 @dataclass
@@ -94,6 +94,23 @@ def _pool_embeds(facts: tuple[Fact, ...]) -> tuple[float, ...]:
     return tuple(s / len(facts) for s in sums)
 
 
+def _frame_boxes(key_frames, trajs: dict[int, Trajectory]):
+    """为每个证据帧收集各 track 在该帧的框,组装成 MLLMRequest.frame_boxes
+    约定的形状 ((t, ((track_id, box), ...)), ...)。真实多模态适配器靠它
+    在关键帧上画框做视觉 grounding;某 track 在该帧无观测(遮挡)时直接
+    省略,不猜框。
+    """
+    boxes = []
+    for t in key_frames:
+        entries = tuple(
+            (tid, fp.box)
+            for tid, traj in sorted(trajs.items())
+            if (fp := traj.frame_at(t)) is not None
+        )
+        boxes.append((t, entries))
+    return tuple(boxes)
+
+
 class Pipeline:
     def __init__(
         self,
@@ -107,11 +124,18 @@ class Pipeline:
         mllm_adapter: Optional[MLLMAdapter] = None,
         output_assembler: Optional[OutputAssembler] = None,
         config: Optional[PipelineConfig] = None,
+        frame_feature_fn: Optional[
+            Callable[[Trajectory], Sequence[tuple[float, ...]]]
+        ] = None,
     ):
         # tracker 没有默认值——它必须由调用方显式提供(Stage-0 下通常是
         # StubTracker 注入的 GT/预置轨迹;真正跑真实 tracker 时替换成
         # 真实实现即可,其余组件的默认值都不用变)。
         self.tracker = tracker
+        # frame_feature_fn:可学习 Unary KFA 的逐帧特征来源(Stage-1a 注入,
+        # 例如 smot.frame_features.geometric_frame_features)。默认 None,
+        # 此时 unary KFA 的 features 参数收到 None,保持 Stage-0 行为。
+        self.frame_feature_fn = frame_feature_fn
         self.motion_fact_extractor = motion_fact_extractor or MotionFactExtractor()
         self.event_filter = event_filter or EventCandidateFilter()
         self.fact_selector = fact_selector or DeterministicFactSelector()
@@ -146,13 +170,13 @@ class Pipeline:
         cost = CostReport()
 
         instances = tuple(
-            self._run_instance(traj, facts, cost) for traj in trajectories
+            self._run_instance(traj, facts, video, cost) for traj in trajectories
         )
         interactions = tuple(
-            self._run_interaction(candidate, facts, traj_by_id, cost)
+            self._run_interaction(candidate, facts, traj_by_id, video, cost)
             for candidate in event_candidates
         )
-        video_assertion = self._run_video(trajectories, facts, cost)
+        video_assertion = self._run_video(trajectories, facts, video, cost)
 
         return PipelineResult(
             instances=instances,
@@ -170,7 +194,7 @@ class Pipeline:
         cost.n_soft_tokens += len(request.soft_tokens)
         return self.mllm_adapter.generate(request)
 
-    def _run_instance(self, traj, facts, cost: CostReport) -> InstanceAssertion:
+    def _run_instance(self, traj, facts, video, cost: CostReport) -> InstanceAssertion:
         """针对单个轨迹:选事实 -> 选关键帧 -> 池化+投影出 soft token ->
         组 prompt -> 问 MLLM -> 组装成断言。evidence_frames 直接取自
         Unary KFA 的选帧结果。
@@ -179,21 +203,36 @@ class Pipeline:
             facts, SelectionContext(scope=f"instance:{traj.track_id}", top_k=self.config.fact_top_k)
         )
         cost.n_facts_selected += len(selection.selected_facts)
-        # Stage-0 没有视觉塔,features 传 None;Stage-1a 在这里换成
-        # 与 per_frame 对齐的逐帧实例视觉特征即可,签名不变。
+        # 逐帧特征由注入的 frame_feature_fn 提供(Stage-1a 的可学习 KFA
+        # 需要它打分);未注入时传 None,NoOp KFA 也不使用。
+        features = (
+            self.frame_feature_fn(traj) if self.frame_feature_fn is not None else None
+        )
         kfa_selection = self.unary_kfa.select(
             traj.track_id,
             list(traj.per_frame),
             self.config.top_k_instance_frames,
-            features=None,
+            features=features,
         )
-        soft_tokens = self.projector.project(_pool_embeds(selection.selected_facts))
+        pooled = _pool_embeds(selection.selected_facts)
+        if kfa_selection.soft_token is not None:
+            # KFA 的 soft 读出向量拼接在事实池化向量之后一起进 projector。
+            # 这是"hard top-k 搭 soft 读出梯度便车"的落地布线:被选中的
+            # 帧走图像通路(离散、无梯度),soft 向量走 projector->soft
+            # token 通路(可导)——两者共享同一组打分,训练信号经 soft
+            # 通路回传给 KFA 打分器。NoOp KFA 返回 None,布线自然短路。
+            pooled = tuple(pooled) + tuple(kfa_selection.soft_token)
+        soft_tokens = self.projector.project(pooled)
         prompt_text = build_instance_prompt(traj.track_id, selection.text)
         request = MLLMRequest(
             prompt_type="instance",
             transcript_text=prompt_text,
             frame_refs=kfa_selection.key_frames,
             soft_tokens=soft_tokens,
+            video_path=video.path,
+            frame_boxes=_frame_boxes(
+                kfa_selection.key_frames, {traj.track_id: traj}
+            ),
         )
         mllm_text = self._generate(request, cost)
         return self.output_assembler.assemble_instance(
@@ -204,7 +243,7 @@ class Pipeline:
         )
 
     def _run_interaction(
-        self, candidate, facts, traj_by_id, cost: CostReport
+        self, candidate, facts, traj_by_id, video, cost: CostReport
     ) -> InteractionAssertion:
         """针对一条候选交互边:构造逐帧 pair 特征 -> 选 pair 事实 ->
         选双方关键帧 -> 池化+投影出 soft token -> 组 prompt -> 问 MLLM ->
@@ -233,16 +272,25 @@ class Pipeline:
             self.config.top_k_pair_frames,
             pair_features=pair_features,
         )
-        soft_tokens = self.projector.project(_pool_embeds(selection.selected_facts))
+        pooled = _pool_embeds(selection.selected_facts)
+        if kfa_selection.soft_token is not None:
+            # 与 _run_instance 相同的布线:pairwise KFA(Stage-1b 起可学习)
+            # 的 soft 读出向量拼进 projector 输入;NoOp 返回 None 时短路。
+            pooled = tuple(pooled) + tuple(kfa_selection.soft_token)
+        soft_tokens = self.projector.project(pooled)
         prompt_text = build_interaction_prompt(subject_id, object_id, selection.text)
+        frames = kfa_selection.key_frames
         request = MLLMRequest(
             prompt_type="interaction",
             transcript_text=prompt_text,
-            frame_refs=kfa_selection.key_frames,
+            frame_refs=frames,
             soft_tokens=soft_tokens,
+            video_path=video.path,
+            frame_boxes=_frame_boxes(
+                frames, {subject_id: traj_i, object_id: traj_j}
+            ),
         )
         mllm_text = self._generate(request, cost)
-        frames = kfa_selection.key_frames
         time_span = (min(frames), max(frames)) if frames else (0, 0)
         return self.output_assembler.assemble_interaction(
             subject_id=subject_id,
@@ -252,7 +300,7 @@ class Pipeline:
             evidence_frames=frames,
         )
 
-    def _run_video(self, trajectories, facts, cost: CostReport) -> VideoAssertion:
+    def _run_video(self, trajectories, facts, video, cost: CostReport) -> VideoAssertion:
         """整段视频级别:involved_ids 汇总所有出现过的 track_id(排序后
         去重),事实选择用 "video" 这个特殊 scope(DeterministicFactSelector
         会把它当作通配符,对全体事实做概括性挑选)。
@@ -269,6 +317,7 @@ class Pipeline:
             transcript_text=prompt_text,
             frame_refs=(),
             soft_tokens=soft_tokens,
+            video_path=video.path,
         )
         mllm_text = self._generate(request, cost)
         return self.output_assembler.assemble_video(mllm_text, involved_ids)

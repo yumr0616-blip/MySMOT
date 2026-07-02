@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Optional
 
@@ -14,6 +15,8 @@ from smot.types import InstanceAssertion, InteractionAssertion, VideoAssertion
 
 _SUBJECT_ID_RE = re.compile(r"subject_id=(\d+)")
 _OBJECT_ID_RE = re.compile(r"object_id=(\d+)")
+
+_JSON_DECODER = json.JSONDecoder()
 
 # 谓词短语命中时,如果它紧前面的词是这些否定词之一,说明 MLLM 实际上在
 # 否定这个交互("never approaches"),不能提取成肯定谓词。
@@ -27,6 +30,58 @@ _NEGATION_WORDS = frozenset(
 # 不是模型的判断,所以把置信度压到这个标记值,让下游评测/分析能把
 # "方向经过模型确认"和"方向只是启发式默认"两类断言区分开。
 UNVERIFIED_DIRECTION_CONFIDENCE = 0.5
+
+
+def _find_structured_interaction(text: str) -> Optional[dict]:
+    """在 MLLM 输出里找出第一个带 "predicate" 键的 JSON 对象。
+
+    真实 MLLM 被要求以结构化 JSON 回答交互任务,但模型经常在 JSON 前后
+    加解释文字或 ```json 围栏,所以不能直接 json.loads 整段文本——从每个
+    '{' 起尝试 raw_decode(它能正确处理字符串里的花括号),找到第一个
+    解析成功且含 predicate 键的对象为止。找不到返回 None,调用方退回
+    自由文本谓词抽取路径(Mock 和不守指令的模型都走那条路)。
+    """
+    idx = text.find("{")
+    while idx != -1:
+        try:
+            obj, _ = _JSON_DECODER.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            obj = None
+        if isinstance(obj, dict) and "predicate" in obj:
+            return obj
+        idx = text.find("{", idx + 1)
+    return None
+
+
+def _as_int(value) -> Optional[int]:
+    """宽容地把 JSON 字段值转成 int(模型可能输出 "1" 或 1.0);
+    转不了返回 None(视为该字段缺失)。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _reconcile_direction(
+    stated: Optional[tuple[int, int]], subject_id: int, object_id: int, confidence: float
+) -> tuple[int, int, float]:
+    """方向对账(结构化 JSON 与正则两条解析路径共用同一套规则):
+
+    调用方传入的 (subject_id, object_id) 只是上游候选边的下标顺序;
+    stated 是模型自己声明的 (subject, object)。
+      - 模型声明的恰好是相反方向 -> 交换,以模型判断为准;
+      - 声明与候选边完全一致    -> 保持,置信度不动;
+      - 声明缺失或对不上号      -> 保持启发式顺序,但置信度压到
+        UNVERIFIED_DIRECTION_CONFIDENCE,让评测能区分"模型确认的方向"
+        和"启发式默认的方向"。
+    """
+    if stated is None:
+        return subject_id, object_id, min(confidence, UNVERIFIED_DIRECTION_CONFIDENCE)
+    if stated == (object_id, subject_id):
+        return object_id, subject_id, confidence
+    if stated != (subject_id, object_id):
+        return subject_id, object_id, min(confidence, UNVERIFIED_DIRECTION_CONFIDENCE)
+    return subject_id, object_id, confidence
 
 
 def _extract_predicate(mllm_text: str, canonical_map: dict[str, str]) -> str:
@@ -90,32 +145,39 @@ class OutputAssembler:
         evidence_frames: tuple[int, ...],
         confidence: float = 1.0,
     ) -> InteractionAssertion:
-        """交互断言:先从 mllm_text 里提取谓词,再映射成规范标签。
+        """交互断言:结构化 JSON 优先,自由文本谓词抽取兜底。
 
-        subject/object 的分配需要和 MLLM 文本对账:调用方传入的
-        (subject_id, object_id) 只是上游候选边的下标顺序(一个启发式,
-        不是模型判断)。这里从 mllm_text 里解析 "subject_id=<n>" /
-        "object_id=<n>",如果模型明确说的是相反方向,就交换双方;
-        解析不出来或对不上号时,沿用启发式顺序但把置信度压到
-        UNVERIFIED_DIRECTION_CONFIDENCE,让评测能区分"模型确认的方向"
-        和"启发式默认的方向"。direction 字段固定为 "subj->obj"
+        真实 MLLM 被要求以 JSON({"subject_id", "object_id", "predicate",
+        "sentence"})回答交互任务:能解析到带 predicate 键的 JSON 对象时,
+        谓词直接取字段值(不再做短语匹配),方向按模型声明的 id 对账;
+        解析不到(Mock、或模型没守指令)时退回原有的正则 + 已知短语
+        最长匹配路径。两条路径的方向对账规则完全相同(见
+        _reconcile_direction),direction 字段固定为 "subj->obj"
         (即最终的 subject_id 是动作发出方)。
         """
-        subj_match = _SUBJECT_ID_RE.search(mllm_text)
-        obj_match = _OBJECT_ID_RE.search(mllm_text)
-        if subj_match and obj_match:
-            stated = (int(subj_match.group(1)), int(obj_match.group(1)))
-            if stated == (object_id, subject_id):
-                # MLLM 明确给出了相反的方向,以模型的判断为准。
-                subject_id, object_id = object_id, subject_id
-            elif stated != (subject_id, object_id):
-                # 解析出的 id 和候选边对不上号(模型说到了别的目标),
-                # 方向无法确认。
-                confidence = min(confidence, UNVERIFIED_DIRECTION_CONFIDENCE)
+        structured = _find_structured_interaction(mllm_text)
+        if structured is not None:
+            stated_subj = _as_int(structured.get("subject_id"))
+            stated_obj = _as_int(structured.get("object_id"))
+            stated = (
+                (stated_subj, stated_obj)
+                if stated_subj is not None and stated_obj is not None
+                else None
+            )
+            predicate = str(structured["predicate"]).strip()
         else:
-            confidence = min(confidence, UNVERIFIED_DIRECTION_CONFIDENCE)
+            subj_match = _SUBJECT_ID_RE.search(mllm_text)
+            obj_match = _OBJECT_ID_RE.search(mllm_text)
+            stated = (
+                (int(subj_match.group(1)), int(obj_match.group(1)))
+                if subj_match and obj_match
+                else None
+            )
+            predicate = _extract_predicate(mllm_text, self.canonical_map)
 
-        predicate = _extract_predicate(mllm_text, self.canonical_map)
+        subject_id, object_id, confidence = _reconcile_direction(
+            stated, subject_id, object_id, confidence
+        )
         return InteractionAssertion(
             subject_id=subject_id,
             object_id=object_id,
