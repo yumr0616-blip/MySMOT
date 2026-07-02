@@ -6,14 +6,25 @@
 占位类实现了同样的 Protocol,用固定的、不学习的规则来选帧,
 soft_token 恒为 None——这样真正的可学习 KFA 接进来的时候,
 Pipeline 的调用方式完全不需要改动。
+
+接口形状说明(§4 的输入契约,Stage-1 接真实现时不需要再改签名):
+  - Unary KFA 的打分依据是"逐帧实例视觉特征",所以 select() 除了
+    frames(框/mask/conf)之外还接收一个与 frames 逐帧对齐的
+    features 序列;Stage-0 没有视觉塔,Pipeline 传 None,NoOp 实现
+    也不使用它。
+  - Pairwise KFA 的打分依据是"候选边逐帧 pair 特征"(两方视觉特征 +
+    确定性相对几何 RelGeom),所以 select() 除了 EventCandidate 之外
+    还接收与 candidate_frames 对齐的 pair_features 序列;Stage-0 由
+    Pipeline 用 smot.pair_features.build_pair_features 确定性构造
+    (视觉特征分量为空,rel_geom 是真实计算值)。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Optional, Protocol, Sequence, runtime_checkable
 
 from smot.event_filter import EventCandidate
-from smot.types import FramePresence
+from smot.types import FramePresence, PairFeature
 
 
 @dataclass(frozen=True)
@@ -28,27 +39,49 @@ class KeyFrameSelection:
 
 @runtime_checkable
 class UnaryKFA(Protocol):
-    """Stage-1a 开始可学习。"""
+    """Stage-1a 开始可学习。features 与 frames 逐帧对齐,是该目标在
+    对应帧上的实例视觉特征向量;Stage-0 没有视觉塔时传 None。
+    """
 
-    def select(self, track_id: int, frames: list[FramePresence], top_k: int) -> KeyFrameSelection: ...
+    def select(
+        self,
+        track_id: int,
+        frames: list[FramePresence],
+        top_k: int,
+        features: Optional[Sequence[tuple[float, ...]]] = None,
+    ) -> KeyFrameSelection: ...
 
 
 @runtime_checkable
 class PairwiseKFA(Protocol):
-    """Stage-1b 开始可学习。"""
+    """Stage-1b 开始可学习。pair_features 与 event_candidate 的
+    candidate_frames 对齐(观测缺失的候选帧会被跳过),携带两方视觉
+    特征和确定性相对几何——这是 pairwise slot 打分方向性的信息来源,
+    缺了它 pairwise 选择会退化成两个 unary 特征的拼接。
+    """
 
     def select(
-        self, edge: tuple[int, int], event_candidate: EventCandidate, top_k: int
+        self,
+        edge: tuple[int, int],
+        event_candidate: EventCandidate,
+        top_k: int,
+        pair_features: Sequence[PairFeature] = (),
     ) -> KeyFrameSelection: ...
 
 
 class NoOpUnaryKFA:
     """Stage-1a 才会变成可学习;这是 Stage-0 的 no-op 默认实现。
     直接在该轨迹的所有观测帧里,按下标等间隔抽取最多 top_k 帧,
-    不做任何"显著性"打分,soft_token 恒为 None。
+    不做任何"显著性"打分(因此也不使用 features),soft_token 恒为 None。
     """
 
-    def select(self, track_id: int, frames: list[FramePresence], top_k: int) -> KeyFrameSelection:
+    def select(
+        self,
+        track_id: int,
+        frames: list[FramePresence],
+        top_k: int,
+        features: Optional[Sequence[tuple[float, ...]]] = None,
+    ) -> KeyFrameSelection:
         ts = [fp.t for fp in frames]
         if not ts:
             return KeyFrameSelection(key_frames=(), soft_token=None)
@@ -68,12 +101,16 @@ class NoOpUnaryKFA:
 class NoOpPairwiseKFA:
     """Stage-1b 才会变成可学习;这是 Stage-0 的 no-op 默认实现。
     直接复用 Event Candidate Filter 已经算好的候选帧(触发交互规则的
-    那些帧),截断到 top_k,不再额外做"双轮廓显著性"选帧,
-    soft_token 恒为 None。
+    那些帧),截断到 top_k,不再额外做"双轮廓显著性"选帧(因此也不
+    使用 pair_features),soft_token 恒为 None。
     """
 
     def select(
-        self, edge: tuple[int, int], event_candidate: EventCandidate, top_k: int
+        self,
+        edge: tuple[int, int],
+        event_candidate: EventCandidate,
+        top_k: int,
+        pair_features: Sequence[PairFeature] = (),
     ) -> KeyFrameSelection:
         chosen = event_candidate.candidate_frames[:top_k]
         return KeyFrameSelection(key_frames=chosen, soft_token=None)

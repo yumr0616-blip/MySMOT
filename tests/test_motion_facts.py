@@ -60,6 +60,20 @@ class TestMotionFactExtractorTwoObject(unittest.TestCase):
         # 3 instance facts each (presence/net_motion/speed) x2 tracks + 2 pair facts
         self.assertEqual(len(all_facts), 3 * 2 + 2)
 
+    def test_embed_temporal_components_are_normalized(self):
+        # embed = (type_index, norm_value, t_start_norm, t_end_norm),
+        # 时间分量按视频最大帧号(fixture 里为 4)归一化到 [0, 1]。
+        all_facts = self.extractor.extract(self.trajectories)
+        presence = [
+            f
+            for f in _facts_by_type(all_facts, FactType.PRESENCE)
+            if f.scope == "instance:1"
+        ][0]
+        self.assertEqual(presence.embed, (4.0, 4.0, 0.0, 1.0))
+        for fact in all_facts:
+            self.assertGreaterEqual(fact.embed[2], 0.0)
+            self.assertLessEqual(fact.embed[3], 1.0)
+
 
 class TestMotionFactExtractorSingleObject(unittest.TestCase):
     def setUp(self):

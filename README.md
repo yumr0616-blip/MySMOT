@@ -36,6 +36,7 @@ extraction, event candidate filtering, output assembly.
 | Frozen Tracker | `smot/tracker.py` | Frozen (`StubTracker` stands in for a real detector+SAM2 tracker) |
 | Motion Fact Extractor | `smot/motion_facts.py` | Deterministic (real) |
 | Event Candidate Filter | `smot/event_filter.py` | Heuristic, not learned (real) |
+| Pair Feature builder | `smot/pair_features.py` | Deterministic (real) — per-frame relative geometry fed into the Pairwise KFA |
 | Fact Selector | `smot/fact_selector.py` | Slot learnable in Stage-1+; `DeterministicFactSelector` is the Stage-0 default |
 | Unary KFA | `smot/kfa.py` | Learnable in Stage-1a; `NoOpUnaryKFA` is the Stage-0 default |
 | Pairwise KFA | `smot/kfa.py` | Learnable in Stage-1b; `NoOpPairwiseKFA` is the Stage-0 default |
@@ -61,7 +62,15 @@ instance/interaction/video assertions) live in `smot/types.py`.
 `Pipeline`'s constructor takes every learnable/model-backed component as an
 optional argument defaulting to its Stage-0 implementation, so upgrading to
 Stage-1a/1b (or plugging in a real tracker/MLLM) requires no change to its
-call signature.
+call signature. The Stage-1 seams are already live in Stage-0: the KFA
+protocols accept per-frame visual features / `PairFeature` sequences (unused
+by the no-op defaults), and the projector's output is wired into
+`MLLMRequest.soft_tokens` — a real projector's tokens reach the MLLM adapter
+with no further plumbing.
+
+Every `PipelineResult` carries a `cost` report (`n_vlm_calls`,
+`n_key_frames`, `n_facts_selected`, `n_soft_tokens`) so the §7 cost metrics
+are measurable from day one.
 
 ## Stack
 

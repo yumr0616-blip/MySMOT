@@ -22,9 +22,13 @@ CANONICAL_MAP: dict[str, str] = {
 }
 
 
-def map_predicate(raw_predicate: str) -> str:
+def map_predicate(raw_predicate: str, canonical_map: dict[str, str] | None = None) -> str:
     """把原始谓词规范化(去首尾空格、转小写)后查表;查不到就原样返回
     规范化后的字符串(fallback,不抛异常)。
+
+    canonical_map 允许调用方传入自定义映射表(§7 的分层 F1 评测需要用
+    不同粒度的映射表重跑同一批断言),不传则用模块级默认表。
     """
+    table = CANONICAL_MAP if canonical_map is None else canonical_map
     normalized = raw_predicate.strip().lower()
-    return CANONICAL_MAP.get(normalized, normalized)
+    return table.get(normalized, normalized)

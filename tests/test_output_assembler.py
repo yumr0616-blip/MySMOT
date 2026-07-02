@@ -48,6 +48,70 @@ class TestOutputAssembler(unittest.TestCase):
         self.assertEqual(assertion.predicate, "the two objects juggle nearby")
         self.assertEqual(assertion.canonical_label, "the two objects juggle nearby")
 
+    def test_assemble_interaction_verified_direction_keeps_confidence(self):
+        assertion = self.assembler.assemble_interaction(
+            subject_id=1,
+            object_id=2,
+            mllm_text="subject_id=1 approaches object_id=2.",
+            time_span=(3, 4),
+            evidence_frames=(3, 4),
+        )
+        self.assertEqual(assertion.confidence, 1.0)
+
+    def test_assemble_interaction_swaps_when_mllm_states_reverse_direction(self):
+        # MLLM 明确说方向相反时,以模型判断为准交换 subject/object,
+        # 而不是沿用上游候选边的下标顺序。
+        assertion = self.assembler.assemble_interaction(
+            subject_id=1,
+            object_id=2,
+            mllm_text="subject_id=2 approaches object_id=1.",
+            time_span=(3, 4),
+            evidence_frames=(3, 4),
+        )
+        self.assertEqual(assertion.subject_id, 2)
+        self.assertEqual(assertion.object_id, 1)
+        self.assertEqual(assertion.confidence, 1.0)
+
+    def test_assemble_interaction_unverified_direction_lowers_confidence(self):
+        # 文本里解析不出 subject_id/object_id 时,方向只是下标启发式,
+        # 置信度应被压到标记值以便下游区分。
+        assertion = self.assembler.assemble_interaction(
+            subject_id=1,
+            object_id=2,
+            mllm_text="the two objects juggle nearby",
+            time_span=(0, 1),
+            evidence_frames=(0, 1),
+        )
+        self.assertEqual(assertion.confidence, 0.5)
+
+    def test_injected_canonical_map_is_used(self):
+        # §7 分层 F1 依赖注入不同粒度的映射表重跑;注入的表必须真正
+        # 生效于谓词提取和规范化两个环节。
+        assembler = OutputAssembler(canonical_map={"juggles": "juggle"})
+        assertion = assembler.assemble_interaction(
+            subject_id=1,
+            object_id=2,
+            mllm_text="subject_id=1 juggles object_id=2.",
+            time_span=(0, 1),
+            evidence_frames=(0, 1),
+        )
+        self.assertEqual(assertion.predicate, "juggles")
+        self.assertEqual(assertion.canonical_label, "juggle")
+
+    def test_negated_predicate_is_not_extracted_as_affirmative(self):
+        assertion = self.assembler.assemble_interaction(
+            subject_id=1,
+            object_id=2,
+            mllm_text="subject_id=1 never approaches object_id=2.",
+            time_span=(0, 1),
+            evidence_frames=(0, 1),
+        )
+        # "never approaches" 不能被提取成肯定的 "approaches",
+        # 应走整句 fallback。
+        self.assertEqual(
+            assertion.predicate, "subject_id=1 never approaches object_id=2."
+        )
+
     def test_assemble_video(self):
         assertion = self.assembler.assemble_video(
             mllm_text="Two tracked objects approach each other during the video.",

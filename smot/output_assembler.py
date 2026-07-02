@@ -6,33 +6,63 @@
 """
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from smot.canonical_labels import CANONICAL_MAP, map_predicate
 from smot.types import InstanceAssertion, InteractionAssertion, VideoAssertion
 
+_SUBJECT_ID_RE = re.compile(r"subject_id=(\d+)")
+_OBJECT_ID_RE = re.compile(r"object_id=(\d+)")
 
-def _extract_predicate(mllm_text: str) -> str:
+# 谓词短语命中时,如果它紧前面的词是这些否定词之一,说明 MLLM 实际上在
+# 否定这个交互("never approaches"),不能提取成肯定谓词。
+_NEGATION_WORDS = frozenset(
+    {"not", "never", "no", "cannot", "doesn't", "don't", "didn't",
+     "isn't", "aren't", "wasn't", "weren't", "won't"}
+)
+
+# MLLM 文本里解析不出(或解析出对不上号的)subject/object id 时,断言的
+# 方向只能沿用上游 Event Candidate Filter 的下标顺序——那只是一个启发式,
+# 不是模型的判断,所以把置信度压到这个标记值,让下游评测/分析能把
+# "方向经过模型确认"和"方向只是启发式默认"两类断言区分开。
+UNVERIFIED_DIRECTION_CONFIDENCE = 0.5
+
+
+def _extract_predicate(mllm_text: str, canonical_map: dict[str, str]) -> str:
     """在 mllm_text 里查找最长的、已知的谓词短语(忽略大小写)。
 
     用"最长匹配"是为了避免像 "approaches" 命中的同时,更具体的短语
-    (如果有的话)被更短的子串抢先匹配掉。如果一个已知谓词都没匹配到,
-    就退回整段文本(去首尾空格)作为谓词——这样即便遇到没预料到的、
-    但依然是真实句子的 MLLM 输出,也能产出一个(未被规范化的)谓词,
-    而不是直接报错中断整个流程。
+    (如果有的话)被更短的子串抢先匹配掉。命中的短语如果紧跟在否定词
+    后面("never approaches"),视为未命中——把否定句提取成肯定谓词
+    比提取失败更糟糕。如果一个已知谓词都没匹配到,就退回整段文本
+    (去首尾空格)作为谓词——这样即便遇到没预料到的、但依然是真实
+    句子的 MLLM 输出,也能产出一个(未被规范化的)谓词,而不是直接
+    报错中断整个流程。
     """
     lowered = mllm_text.lower()
-    candidates = [phrase for phrase in CANONICAL_MAP if phrase in lowered]
+    candidates = []
+    for phrase in canonical_map:
+        idx = lowered.find(phrase)
+        if idx == -1:
+            continue
+        preceding = lowered[:idx].split()
+        if preceding and preceding[-1] in _NEGATION_WORDS:
+            continue
+        candidates.append(phrase)
     if not candidates:
         return mllm_text.strip()
     return max(candidates, key=len)
 
 
 class OutputAssembler:
-    """确定性。"""
+    """确定性。canonical_map 可注入自定义映射表(§7 分层 F1 评测需要
+    用 synonym-merged / coarse 等不同粒度的表重跑),不注入则用全局
+    默认表 CANONICAL_MAP。
+    """
 
     def __init__(self, canonical_map: Optional[dict[str, str]] = None):
-        self.canonical_map = canonical_map or CANONICAL_MAP
+        self.canonical_map = canonical_map if canonical_map is not None else CANONICAL_MAP
 
     def assemble_instance(
         self,
@@ -60,18 +90,37 @@ class OutputAssembler:
         evidence_frames: tuple[int, ...],
         confidence: float = 1.0,
     ) -> InteractionAssertion:
-        """交互断言:先从 mllm_text 里提取谓词,再映射成规范标签,
-        subject/object 的方向固定记为 "subj->obj"(即
-        subject_id 是动作发出方,object_id 是接受方)。
-        confidence 在 Stage-0 阶段是一个占位常数(默认 1.0),
-        等真正有打分机制(比如 MLLM 输出的置信度或规则打分)时再替换。
+        """交互断言:先从 mllm_text 里提取谓词,再映射成规范标签。
+
+        subject/object 的分配需要和 MLLM 文本对账:调用方传入的
+        (subject_id, object_id) 只是上游候选边的下标顺序(一个启发式,
+        不是模型判断)。这里从 mllm_text 里解析 "subject_id=<n>" /
+        "object_id=<n>",如果模型明确说的是相反方向,就交换双方;
+        解析不出来或对不上号时,沿用启发式顺序但把置信度压到
+        UNVERIFIED_DIRECTION_CONFIDENCE,让评测能区分"模型确认的方向"
+        和"启发式默认的方向"。direction 字段固定为 "subj->obj"
+        (即最终的 subject_id 是动作发出方)。
         """
-        predicate = _extract_predicate(mllm_text)
+        subj_match = _SUBJECT_ID_RE.search(mllm_text)
+        obj_match = _OBJECT_ID_RE.search(mllm_text)
+        if subj_match and obj_match:
+            stated = (int(subj_match.group(1)), int(obj_match.group(1)))
+            if stated == (object_id, subject_id):
+                # MLLM 明确给出了相反的方向,以模型的判断为准。
+                subject_id, object_id = object_id, subject_id
+            elif stated != (subject_id, object_id):
+                # 解析出的 id 和候选边对不上号(模型说到了别的目标),
+                # 方向无法确认。
+                confidence = min(confidence, UNVERIFIED_DIRECTION_CONFIDENCE)
+        else:
+            confidence = min(confidence, UNVERIFIED_DIRECTION_CONFIDENCE)
+
+        predicate = _extract_predicate(mllm_text, self.canonical_map)
         return InteractionAssertion(
             subject_id=subject_id,
             object_id=object_id,
             predicate=predicate,
-            canonical_label=map_predicate(predicate),
+            canonical_label=map_predicate(predicate, self.canonical_map),
             time_span=time_span,
             evidence_frames=evidence_frames,
             confidence=confidence,

@@ -68,6 +68,31 @@ class Trajectory:
     present: tuple[int, int]  # (t_in, t_out),闭区间
     per_frame: tuple[FramePresence, ...]
 
+    def __post_init__(self):
+        """构造时做数据契约校验。下游多个模块(净位移取首末帧、KFA 等
+        间隔抽帧、approach 首尾距离对比)都隐式依赖 per_frame 按帧号
+        升序;真实 tracker/数据加载器一旦输出乱序或帧号越界的数据,
+        这些计算会"静默算错"而不报任何异常——所以在数据入口处直接
+        fail-fast,把问题暴露在构造时而不是评测数字上。
+        """
+        if self.present[0] > self.present[1]:
+            raise ValueError(
+                f"Trajectory(track_id={self.track_id}): present 区间起点 "
+                f"{self.present[0]} 大于终点 {self.present[1]}"
+            )
+        ts = [fp.t for fp in self.per_frame]
+        for a, b in zip(ts, ts[1:]):
+            if b <= a:
+                raise ValueError(
+                    f"Trajectory(track_id={self.track_id}): per_frame 帧号必须"
+                    f"严格递增,发现 {a} 之后出现 {b}"
+                )
+        if ts and (ts[0] < self.present[0] or ts[-1] > self.present[1]):
+            raise ValueError(
+                f"Trajectory(track_id={self.track_id}): per_frame 帧号范围 "
+                f"[{ts[0]}, {ts[-1]}] 超出 present 区间 {self.present}"
+            )
+
     def frame_at(self, t: int) -> Optional[FramePresence]:
         """按帧号 t 查找该轨迹在这一帧的观测;找不到返回 None(表示该帧
         该目标缺失,例如被遮挡)。
@@ -112,8 +137,10 @@ class Fact:
     embed 约定(固定为 4 个 float):
         (type_index, norm_value, t_span_start_norm, t_span_end_norm)
     其中 type_index 是该事实类型在 FACT_TYPE_ORDER 中的下标;
-    norm_value / t_span 在本脚手架阶段暂时就是原始数值(还没有做
-    跨数据集的归一化,等真正训练 Fact Selector 时再补)。
+    t_span 两个分量已按视频时长归一化到 [0, 1](否则长视频的原始帧号
+    数值会淹没另外两个维度的打分信号);norm_value 暂时是原始数值
+    (跨数据集的数值归一化需要数据集统计量,等真正训练 Fact Selector
+    时再补,这是 Stage-1a 验收清单上的显式事项)。
     """
 
     type: FactType
