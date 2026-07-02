@@ -83,7 +83,8 @@ class MotionFactExtractor:
         for a, b in zip(traj.per_frame, traj.per_frame[1:]):
             dt = b.t - a.t
             if dt <= 0:
-                # 帧号异常(重复或倒序)时跳过这一段,避免除零/负数干扰。
+                # 防御性守卫:Trajectory 构造时已校验帧号严格递增,
+                # 正常情况下不会触发;保留是为了避免除零。
                 continue
             speeds.append(dist(centroid(a.box), centroid(b.box)) / dt)
         mean_speed = sum(speeds) / len(speeds) if speeds else 0.0
@@ -120,7 +121,10 @@ class MotionFactExtractor:
             # 两者从未同时出现过(比如时间上完全错开),无法算 pair 事实。
             return facts
 
-        scope = f"pair:{traj_i.track_id},{traj_j.track_id}"
+        # scope 键统一用排序后的 id,与调用方传入两条轨迹的先后顺序解耦
+        # (pair 事实本身是对称的;方向语义不在 scope 里表达)。
+        lo, hi = sorted((traj_i.track_id, traj_j.track_id))
+        scope = f"pair:{lo},{hi}"
         t_span = (common_ts[0], common_ts[-1])
         distances = [
             dist(centroid(traj_i.frame_at(t).box), centroid(traj_j.frame_at(t).box))

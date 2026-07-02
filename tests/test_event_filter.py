@@ -69,10 +69,30 @@ class TestProximityGate(unittest.TestCase):
 
 
 class TestOcclusionVisibilityGap(unittest.TestCase):
-    def test_common_visibility_gap_marks_both_boundary_frames(self):
-        """一方观测缺失(真实遮挡的主信号)造成公共可见帧序列出现空洞
-        时,空洞两侧的帧(消失前最后一帧、重新出现第一帧)都应被记为
-        遮挡边界触发帧。
+    def test_nearby_visibility_gap_marks_both_boundary_frames(self):
+        """一方观测缺失(真实遮挡的主信号)造成公共可见帧序列出现空洞,
+        且消失时刻两目标离得足够近(可能是被对方遮挡)时,空洞两侧的帧
+        (消失前最后一帧、重新出现第一帧)都应被记为遮挡边界触发帧。
+        """
+        track_a = Trajectory(
+            track_id=1,
+            present=(0, 5),
+            per_frame=tuple(FramePresence(t=t, box=(0, 0, 10, 10)) for t in range(6)),
+        )
+        track_b = Trajectory(
+            track_id=2,
+            present=(0, 5),
+            per_frame=tuple(
+                FramePresence(t=t, box=(20, 0, 30, 10)) for t in (0, 1, 4, 5)
+            ),
+        )
+        filt = EventCandidateFilter()
+        self.assertEqual(filt._occlusion_boundary_frames(track_a, track_b), [1, 4])
+
+    def test_far_away_visibility_gap_is_gated_out(self):
+        """观测缺失也可能只是 tracker 在别处单纯跟丢:消失时刻两目标
+        相距很远("被对方遮挡"不成立)时,空洞边界帧应被邻近度门控
+        排除,不产生触发帧。
         """
         track_a = Trajectory(
             track_id=1,
@@ -87,7 +107,33 @@ class TestOcclusionVisibilityGap(unittest.TestCase):
             ),
         )
         filt = EventCandidateFilter()
-        self.assertEqual(filt._occlusion_boundary_frames(track_a, track_b), [1, 4])
+        self.assertEqual(filt._occlusion_boundary_frames(track_a, track_b), [])
+
+    def test_tracker_blink_does_not_broadcast_candidate_edges(self):
+        """一个目标被跟丢一次,不应让它和场上所有(距离很远的)目标
+        都组成候选边——候选边数量就是 MLLM 调用次数。
+        """
+        track1 = Trajectory(
+            track_id=1,
+            present=(0, 5),
+            per_frame=tuple(FramePresence(t=t, box=(0, 0, 10, 10)) for t in range(6)),
+        )
+        track2 = Trajectory(
+            track_id=2,
+            present=(0, 5),
+            per_frame=tuple(
+                FramePresence(t=t, box=(100, 0, 110, 10)) for t in (0, 1, 4, 5)
+            ),
+        )
+        track3 = Trajectory(
+            track_id=3,
+            present=(0, 5),
+            per_frame=tuple(
+                FramePresence(t=t, box=(300, 0, 310, 10)) for t in range(6)
+            ),
+        )
+        candidates = EventCandidateFilter().find_candidates([track1, track2, track3])
+        self.assertEqual(candidates, [])
 
 
 class TestEventCandidateFilterSingleObject(unittest.TestCase):

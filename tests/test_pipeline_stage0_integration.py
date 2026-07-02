@@ -127,6 +127,17 @@ class TestPipelineStage0Integration(unittest.TestCase):
         self.assertEqual(interaction.subject_id, 2)
         self.assertEqual(interaction.object_id, 1)
 
+    def test_duplicate_track_ids_raise(self):
+        # track_id 是全流程主键,重复必须在入口 fail-fast,
+        # 而不是让 traj_by_id 静默塌缩、断言错配。
+        dup = [
+            self.trajectories[0],
+            self.trajectories[0],
+        ]
+        pipeline = Pipeline(tracker=StubTracker(dup))
+        with self.assertRaises(ValueError):
+            pipeline.run(self.video)
+
     def test_cost_report_counts_vlm_calls(self):
         result = self.pipeline.run(self.video)
         expected_calls = len(result.instances) + len(result.interactions) + 1

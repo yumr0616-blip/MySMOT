@@ -133,6 +133,13 @@ class Pipeline:
         全程在 cost 里累加成本计数。
         """
         trajectories = self.tracker.track(video)
+        # track_id 是全流程的主键(事实 scope、候选边、断言归因都靠它),
+        # 重复的 id 会让下面的 traj_by_id 静默塌缩、断言错配——在入口
+        # fail-fast,与 Trajectory 的构造校验同一哲学。
+        seen_ids = [traj.track_id for traj in trajectories]
+        if len(seen_ids) != len(set(seen_ids)):
+            dupes = sorted({i for i in seen_ids if seen_ids.count(i) > 1})
+            raise ValueError(f"tracker 输出了重复的 track_id: {dupes}")
         facts = self.motion_fact_extractor.extract(trajectories)
         event_candidates = self.event_filter.find_candidates(trajectories)
         traj_by_id = {traj.track_id: traj for traj in trajectories}
@@ -212,9 +219,12 @@ class Pipeline:
         subject_id, object_id = candidate.edge
         traj_i, traj_j = traj_by_id[subject_id], traj_by_id[object_id]
         pair_features = build_pair_features(traj_i, traj_j, candidate.candidate_frames)
+        # scope 键统一用排序后的 id(和 MotionFactExtractor 的约定一致),
+        # 与轨迹列表顺序解耦;subject/object 的方向语义只体现在 prompt 里。
+        lo, hi = sorted((subject_id, object_id))
         selection = self.fact_selector.select(
             facts,
-            SelectionContext(scope=f"pair:{subject_id},{object_id}", top_k=self.config.fact_top_k),
+            SelectionContext(scope=f"pair:{lo},{hi}", top_k=self.config.fact_top_k),
         )
         cost.n_facts_selected += len(selection.selected_facts)
         kfa_selection = self.pairwise_kfa.select(

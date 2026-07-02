@@ -37,6 +37,24 @@ class KeyFrameSelection:
     soft_token: tuple[float, ...] | None
 
 
+def _evenly_spaced(ts: Sequence[int], top_k: int) -> tuple[int, ...]:
+    """从有序帧号序列里等间隔抽取最多 top_k 帧(保证首尾都被覆盖),
+    两个 NoOp KFA 共用:不做任何"显著性"打分,只求覆盖整个时段,
+    避免简单截断把证据帧全部偏向序列开头。
+    """
+    if not ts:
+        return ()
+    if len(ts) <= top_k:
+        # 总帧数本来就不超过 top_k,全部保留即可,不需要再抽稀。
+        return tuple(ts)
+    # 在 [0, len(ts)-1] 的下标范围内等间隔取 top_k 个下标
+    # (用 set 去重是为了防止 round() 后出现重复下标),
+    # 从而得到近似均匀分布在整个时段上的关键帧。
+    step = (len(ts) - 1) / (top_k - 1) if top_k > 1 else 0
+    indices = sorted({round(i * step) for i in range(top_k)})
+    return tuple(ts[i] for i in indices)
+
+
 @runtime_checkable
 class UnaryKFA(Protocol):
     """Stage-1a 开始可学习。features 与 frames 逐帧对齐,是该目标在
@@ -83,26 +101,15 @@ class NoOpUnaryKFA:
         features: Optional[Sequence[tuple[float, ...]]] = None,
     ) -> KeyFrameSelection:
         ts = [fp.t for fp in frames]
-        if not ts:
-            return KeyFrameSelection(key_frames=(), soft_token=None)
-        if len(ts) <= top_k:
-            # 总帧数本来就不超过 top_k,全部保留即可,不需要再抽稀。
-            chosen = ts
-        else:
-            # 在 [0, len(ts)-1] 的下标范围内等间隔取 top_k 个下标
-            # (用 set 去重是为了防止 round() 后出现重复下标),
-            # 从而得到近似均匀分布在整个出现时段上的关键帧。
-            step = (len(ts) - 1) / (top_k - 1) if top_k > 1 else 0
-            indices = sorted({round(i * step) for i in range(top_k)})
-            chosen = [ts[i] for i in indices]
-        return KeyFrameSelection(key_frames=tuple(chosen), soft_token=None)
+        return KeyFrameSelection(key_frames=_evenly_spaced(ts, top_k), soft_token=None)
 
 
 class NoOpPairwiseKFA:
     """Stage-1b 才会变成可学习;这是 Stage-0 的 no-op 默认实现。
     直接复用 Event Candidate Filter 已经算好的候选帧(触发交互规则的
-    那些帧),截断到 top_k,不再额外做"双轮廓显著性"选帧(因此也不
-    使用 pair_features),soft_token 恒为 None。
+    那些帧),等间隔抽稀到 top_k(而不是简单截断——截断会把证据帧
+    全部偏向事件开头),不再额外做"双轮廓显著性"选帧(因此也不使用
+    pair_features),soft_token 恒为 None。
     """
 
     def select(
@@ -112,5 +119,5 @@ class NoOpPairwiseKFA:
         top_k: int,
         pair_features: Sequence[PairFeature] = (),
     ) -> KeyFrameSelection:
-        chosen = event_candidate.candidate_frames[:top_k]
+        chosen = _evenly_spaced(event_candidate.candidate_frames, top_k)
         return KeyFrameSelection(key_frames=chosen, soft_token=None)

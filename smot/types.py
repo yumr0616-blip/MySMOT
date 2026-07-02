@@ -92,19 +92,18 @@ class Trajectory:
                 f"Trajectory(track_id={self.track_id}): per_frame 帧号范围 "
                 f"[{ts[0]}, {ts[-1]}] 超出 present 区间 {self.present}"
             )
+        # 顺手建一个帧号 -> 观测的索引,让 frame_at 是 O(1)——事件过滤、
+        # pair 事实、pair 特征构造都在 O(n^2) 的 pair 循环里逐帧调 frame_at,
+        # 线性扫描会把每对的复杂度推到 O(n^2)。frozen dataclass 里用
+        # object.__setattr__ 绕过不可变限制;_by_t 不是 dataclass field,
+        # 不影响相等性/repr/dataclasses.asdict。
+        object.__setattr__(self, "_by_t", {fp.t: fp for fp in self.per_frame})
 
     def frame_at(self, t: int) -> Optional[FramePresence]:
         """按帧号 t 查找该轨迹在这一帧的观测;找不到返回 None(表示该帧
         该目标缺失,例如被遮挡)。
         """
-        for fp in self.per_frame:
-            if fp.t == t:
-                return fp
-        return None
-
-    def frames_in_span(self, t_a: int, t_b: int) -> tuple[FramePresence, ...]:
-        """返回落在 [t_a, t_b] 闭区间内的所有帧观测,按原有顺序。"""
-        return tuple(fp for fp in self.per_frame if t_a <= fp.t <= t_b)
+        return self._by_t.get(t)
 
 
 class FactType(str, Enum):

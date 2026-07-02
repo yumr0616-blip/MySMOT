@@ -90,4 +90,9 @@ python -m unittest discover -s tests -v
 
 # Run the Stage-0 end-to-end demo on a synthetic two-object fixture
 python examples/run_stage0.py
+
+# Evaluate predictions against gold annotations (§7: tiered interaction F1
+# strict / synonym-merged / coarse, direction accuracy, instance coverage,
+# cost aggregation). Both files hold a PipelineResult JSON or a list of them.
+python -m smot.eval pred.json gold.json
 ```

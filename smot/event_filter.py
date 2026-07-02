@@ -72,6 +72,8 @@ class EventCandidateFilter:
             return []
         speeds = []
         for a, b in zip(frames, frames[1:]):
+            # dt > 0 由 Trajectory 构造校验保证,这里的条件只是防御性
+            # 除零守卫。
             dt = b.t - a.t
             speeds.append(dist(centroid(a.box), centroid(b.box)) / dt if dt > 0 else 0.0)
 
@@ -126,11 +128,17 @@ class EventCandidateFilter:
         """遮挡边界触发,两类信号:
 
         1) 重叠状态跳变:两个目标的框 IoU 是否达到阈值,发生"从不重叠到
-           重叠"或反向的跳变,往往对应遮挡开始/结束的时刻。
+           重叠"或反向的跳变,往往对应遮挡开始/结束的时刻。重叠本身就
+           蕴含"离得近",所以这类信号不需要再做邻近度门控。
         2) 公共可见性断点:真实遮挡的主信号其实是"观测缺失"——目标被
            挡住时 tracker 根本给不出框。所以公共观测帧序列里出现空洞
-           (相邻公共帧号不连续)时,把空洞两侧的帧都记为触发帧
-           (消失前最后一帧 + 重新出现的第一帧)。
+           (相邻公共帧号不连续)时,把空洞两侧的帧记为触发帧(消失前
+           最后一帧 + 重新出现的第一帧)。但观测缺失也可能只是 tracker
+           在别处单纯跟丢了——如果不加限制,一个目标的一次跟丢会把它和
+           场上所有目标的候选边全部点亮(与速度/方向突变同样的广播
+           爆炸)。所以空洞边界帧必须通过 _pair_close_at 邻近度门控
+           (边界帧是公共观测帧,双方都有框,距离可算):只有消失时刻
+           这对目标本来就离得近,"被对方遮挡"才是合理怀疑。
         """
         common_ts = sorted(
             {fp.t for fp in traj_i.per_frame} & {fp.t for fp in traj_j.per_frame}
@@ -146,7 +154,11 @@ class EventCandidateFilter:
             if overlapping[k] != overlapping[k - 1]:
                 triggered.add(common_ts[k])
             if common_ts[k] - common_ts[k - 1] > 1:
-                triggered.update((common_ts[k - 1], common_ts[k]))
+                triggered.update(
+                    t
+                    for t in (common_ts[k - 1], common_ts[k])
+                    if self._pair_close_at(traj_i, traj_j, t)
+                )
         return sorted(triggered)
 
     def _pair_close_at(self, traj_i: Trajectory, traj_j: Trajectory, t: int) -> bool:

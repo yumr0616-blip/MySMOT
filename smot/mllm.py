@@ -21,7 +21,9 @@ _OBJECT_ID_RE = re.compile(r"object_id=(\d+)")
 @dataclass(frozen=True)
 class MLLMRequest:
     """发给 MLLM 的一次请求:任务类型 + transcript 文本(prompts.py
-    构造出的完整 prompt)+ 关键帧引用 + (Stage-0 恒为空的)soft token。
+    构造出的完整 prompt)+ 关键帧引用 + soft token(默认空,由 Pipeline
+    把 projector 的输出接进来;Stage-0 的 NoOpProjector 不产 token,
+    真实 projector 的 token 会原样到达这里)。
     """
 
     prompt_type: str  # "instance" | "interaction" | "video"
