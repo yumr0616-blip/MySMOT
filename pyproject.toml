@@ -9,7 +9,16 @@ dependencies = []
 dev = ["pytest"]
 # Introduced when real KFA/Projector/Fact-Selector slots need soft-token
 # injection via inputs_embeds (Stage-1a/1b, per design doc §9).
-ml = ["torch", "transformers"]
+# torch 需要 cu128 构建(RTX 50 系 Blackwell/sm_120):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+ml = [
+    "torch",
+    "transformers",
+    "accelerate",
+    "bitsandbytes",
+    "opencv-python",
+    "pillow",
+]
 
 [tool.setuptools.packages.find]
 include = ["smot*"]
