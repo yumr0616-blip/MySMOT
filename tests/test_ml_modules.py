@@ -147,6 +147,18 @@ class SoftTokenInjectionTest(unittest.TestCase):
         self.assertEqual(tuple(inputs["mm_token_type_ids"].shape), (1, 5))
         self.assertEqual(int(inputs["mm_token_type_ids"][0, -1]), 0)
 
+    def test_placeholder_insert_at_position(self):
+        """position 指定时在序列中间插入(soft token 放在用户回合末尾、
+        assistant 生成头之前的布局依赖这一行为)。"""
+        inputs = {
+            "input_ids": torch.tensor([[10, 11, 12, 13]]),
+            "attention_mask": torch.ones(1, 4, dtype=torch.long),
+        }
+        start = append_placeholder_tokens(inputs, 2, pad_id=0, position=3)
+        self.assertEqual(start, 3)
+        self.assertEqual(inputs["input_ids"][0].tolist(), [10, 11, 12, 0, 0, 13])
+        self.assertEqual(tuple(inputs["attention_mask"].shape), (1, 6))
+
     def test_hook_replaces_positions_and_carries_gradient(self):
         model = _TinyEmbedModel()
         ids = torch.tensor([[1, 2, 3, 0, 0]])  # 后两个是占位 token

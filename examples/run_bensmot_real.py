@@ -69,12 +69,20 @@ def main() -> int:
         quantize_4bit=args.quantize_4bit,
     )
 
-    kfa = projector = None
+    kfa = projector = fact_transform = None
     if args.checkpoint:
+        from smot.fact_norm import make_fact_embed_normalizer
         from smot.ml.checkpoint import load_stage1a_checkpoint
 
         kfa, projector, extra = load_stage1a_checkpoint(args.checkpoint, device="cuda")
-        print(f"[checkpoint] 已加载 {args.checkpoint}: {extra}", file=sys.stderr)
+        # 训练时的 fact 统计量随 checkpoint 保存,推理侧必须做同一份
+        # embed 归一化,否则 projector 收到的输入分布与训练时不一致。
+        if extra.get("fact_stats"):
+            fact_transform = make_fact_embed_normalizer(extra["fact_stats"])
+        print(
+            f"[checkpoint] 已加载 {args.checkpoint}: epochs={extra.get('epochs')},"
+            f" steps={extra.get('steps')}", file=sys.stderr,
+        )
 
     preds: list[dict] = []
     for seq in sequences:
@@ -98,6 +106,7 @@ def main() -> int:
                 frame_feature_fn=lambda traj, _tm=t_max: geometric_frame_features(
                     traj, t_max=_tm
                 ),
+                fact_transform=fact_transform,
             )
         pipeline = Pipeline(**pipeline_kwargs)
         result = pipeline.run(sequence_to_video_handle(seq))

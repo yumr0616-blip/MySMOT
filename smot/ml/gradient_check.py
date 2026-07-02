@@ -29,9 +29,8 @@ from smot.frame_features import FRAME_FEATURE_DIM
 from smot.ml.projector import MLPProjector
 from smot.ml.qwen_adapter import (
     DEFAULT_MODEL_ID,
-    append_placeholder_tokens,
     load_frozen_qwen,
-    soft_token_injection,
+    teacher_forced_loss,
 )
 from smot.ml.unary_kfa import LearnableUnaryKFA
 
@@ -82,7 +81,8 @@ def run_gradient_check(
     pooled = torch.cat([fact_vector, soft_vector])
     soft_tokens = projector(pooled).squeeze(0)  # (n_tokens, d_llm)
 
-    # ---- 组多模态 prompt + 教师强制目标 ----
+    # ---- 组多模态 prompt + 教师强制目标:与训练循环共用同一条组装
+    # 路径(teacher_forced_loss),门禁校验过的就是训练真正跑的。 ----
     messages = [
         {
             "role": "user",
@@ -92,42 +92,7 @@ def run_gradient_check(
             ],
         }
     ]
-    inputs = processor.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt",
-    ).to(device)
-    eos_id = processor.tokenizer.eos_token_id
-    start = append_placeholder_tokens(inputs, soft_tokens.shape[0], eos_id)
-
-    target_ids = processor.tokenizer(
-        _TARGET_TEXT, return_tensors="pt", add_special_tokens=False
-    ).input_ids.to(device)
-    target_ids = torch.cat(
-        [target_ids, torch.tensor([[eos_id]], device=device)], dim=1
-    )
-
-    prompt_ids = inputs["input_ids"]
-    full_ids = torch.cat([prompt_ids, target_ids], dim=1)
-    # prompt + soft 占位段不参与 loss(-100),只有目标句参与。
-    labels = torch.cat([torch.full_like(prompt_ids, -100), target_ids], dim=1)
-    forward_kwargs = {
-        "input_ids": full_ids,
-        "attention_mask": torch.ones_like(full_ids),
-        "labels": labels,
-        "pixel_values": inputs["pixel_values"],
-        "image_grid_thw": inputs["image_grid_thw"],
-    }
-    if inputs.get("mm_token_type_ids") is not None:
-        forward_kwargs["mm_token_type_ids"] = torch.cat(
-            [inputs["mm_token_type_ids"], torch.zeros_like(target_ids)], dim=1
-        )
-
-    with soft_token_injection(model, soft_tokens, start):
-        output = model(**forward_kwargs)
-    loss = output.loss
+    loss = teacher_forced_loss(model, processor, messages, soft_tokens, _TARGET_TEXT)
     loss.backward()
 
     # ---- 断言收集 ----

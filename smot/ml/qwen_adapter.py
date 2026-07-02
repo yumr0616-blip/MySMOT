@@ -83,28 +83,144 @@ def load_frozen_qwen(
     return model, processor
 
 
-def append_placeholder_tokens(inputs, m: int, pad_id: int) -> int:
-    """在 tokenized prompt 末尾追加 m 个占位 token,返回注入起始位置。
+def compose_prompt_text(
+    prompt_type: str,
+    transcript_text: str,
+    frame_boxes=(),
+    has_images: bool = False,
+) -> str:
+    """transcript + 颜色图例(与画框颜色同源)+ 任务输出指令。
+
+    推理适配器与训练循环共用:训练时喂给模型的 prompt 必须和推理时
+    完全同构,否则就是自找 train/test 分布错配。
+    """
+    parts = [transcript_text]
+    if has_images and frame_boxes:
+        track_ids = sorted(
+            {tid for _t, entries in frame_boxes for tid, _box in entries}
+        )
+        if track_ids:
+            legend = ", ".join(
+                f"id={tid} is the {color_for_track(tid)} box" for tid in track_ids
+            )
+            parts.append(f"Box color legend: {legend}.")
+    instruction = _TASK_INSTRUCTIONS.get(prompt_type)
+    if instruction is None:
+        raise ValueError(f"unknown prompt_type: {prompt_type!r}")
+    parts.append(instruction)
+    return "\n".join(parts)
+
+
+def teacher_forced_loss(model, processor, messages, soft_tokens, target_text: str):
+    """一次教师强制前向的完整组装,返回(未反传的)CE loss。
+
+    chat template -> soft 占位追加 -> 目标句 token 拼接 -> labels 掩码
+    (prompt + soft 段为 -100,只有目标句参与 loss)-> soft 注入 -> forward。
+    训练循环(smot.ml.training)与梯度门禁(smot.ml.gradient_check)共用
+    这一条路径:门禁校验过的就是训练真正跑的,两者不允许各写一份。
+
+    soft_tokens: (m, d_llm) 张量或 None(无 soft token 的对照/消融)。
+    """
+    device = model.device
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(device)
+    eos_id = processor.tokenizer.eos_token_id
+
+    start = 0
+    if soft_tokens is not None and soft_tokens.shape[0] > 0:
+        start = append_placeholder_tokens(
+            inputs,
+            soft_tokens.shape[0],
+            eos_id,
+            position=soft_token_position(processor, messages, inputs),
+        )
+
+    target_ids = processor.tokenizer(
+        target_text, return_tensors="pt", add_special_tokens=False
+    ).input_ids.to(device)
+    target_ids = torch.cat(
+        [target_ids, torch.tensor([[eos_id]], device=device)], dim=1
+    )
+
+    prompt_ids = inputs["input_ids"]
+    full_ids = torch.cat([prompt_ids, target_ids], dim=1)
+    labels = torch.cat([torch.full_like(prompt_ids, -100), target_ids], dim=1)
+    forward_kwargs = {
+        "input_ids": full_ids,
+        "attention_mask": torch.ones_like(full_ids),
+        "labels": labels,
+    }
+    for key in ("pixel_values", "image_grid_thw"):
+        if inputs.get(key) is not None:
+            forward_kwargs[key] = inputs[key]
+    if inputs.get("mm_token_type_ids") is not None:
+        forward_kwargs["mm_token_type_ids"] = torch.cat(
+            [inputs["mm_token_type_ids"], torch.zeros_like(target_ids)], dim=1
+        )
+
+    with soft_token_injection(model, soft_tokens, start):
+        return model(**forward_kwargs).loss
+
+
+def append_placeholder_tokens(
+    inputs, m: int, pad_id: int, position: Optional[int] = None
+) -> int:
+    """在 tokenized prompt 的 position 处插入 m 个占位 token,返回注入
+    起始位置(position 为 None 时追加到末尾)。
 
     占位 token 的具体 id 无所谓(其嵌入会被 hook 整体替换),这里用
     调用方传入的 pad/eos id。所有与序列长度对齐的字段(attention_mask、
-    mm_token_type_ids)同步延长,否则模型侧的形状校验会炸。
+    mm_token_type_ids)同步在同一位置插入,否则模型侧的形状校验会炸。
     """
     ids = inputs["input_ids"]
-    start = ids.shape[1]
+    start = ids.shape[1] if position is None else position
     filler = torch.full((ids.shape[0], m), pad_id, dtype=ids.dtype, device=ids.device)
-    inputs["input_ids"] = torch.cat([ids, filler], dim=1)
+
+    def insert(tensor, fill):
+        return torch.cat([tensor[:, :start], fill, tensor[:, start:]], dim=1)
+
+    inputs["input_ids"] = insert(ids, filler)
     if inputs.get("attention_mask") is not None:
-        mask = inputs["attention_mask"]
-        inputs["attention_mask"] = torch.cat(
-            [mask, torch.ones_like(filler)], dim=1
+        inputs["attention_mask"] = insert(
+            inputs["attention_mask"], torch.ones_like(filler)
         )
     if inputs.get("mm_token_type_ids") is not None:
-        mm = inputs["mm_token_type_ids"]
-        inputs["mm_token_type_ids"] = torch.cat(
-            [mm, torch.zeros_like(filler)], dim=1
+        inputs["mm_token_type_ids"] = insert(
+            inputs["mm_token_type_ids"], torch.zeros_like(filler)
         )
     return start
+
+
+def soft_token_position(processor, messages, inputs) -> int:
+    """soft token 的插入位置:用户回合结束之后、assistant 生成头之前。
+
+    直接追加在完整 prompt(含 "<|im_start|>assistant\\n")末尾的话,
+    soft 向量会占据"助手回复的开头"——欠训练阶段模型容易把这些非词表
+    向量接成回合边界符(实测吐出空串/"user"),放在用户回合之后则是
+    "附加上下文"的语义,生成从干净的 assistant 头起步,推理鲁棒得多。
+
+    实现:再 tokenize 一次不带 generation prompt 的模板,其长度即插入
+    位置。防御性校验它确实是完整 prompt 的前缀——万一未来某个模板不
+    满足前缀关系,退回"末尾追加"而不是插错位置。
+    """
+    without_gen = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    full_ids = inputs["input_ids"]
+    prefix_ids = without_gen["input_ids"].to(full_ids.device)
+    n = prefix_ids.shape[1]
+    if n <= full_ids.shape[1] and bool(torch.equal(full_ids[:, :n], prefix_ids)):
+        return n
+    return full_ids.shape[1]
 
 
 @contextlib.contextmanager
@@ -197,7 +313,10 @@ class QwenMLLMAdapter:
                     f"soft token 维度 {soft.shape[-1]} 与模型嵌入维度 {d_llm} 不一致"
                 )
             start = append_placeholder_tokens(
-                inputs, soft.shape[0], self._processor.tokenizer.eos_token_id
+                inputs,
+                soft.shape[0],
+                self._processor.tokenizer.eos_token_id,
+                position=soft_token_position(self._processor, messages, inputs),
             )
 
         prompt_len = inputs["input_ids"].shape[1]
@@ -233,19 +352,9 @@ class QwenMLLMAdapter:
         return images
 
     def _compose_text(self, request: MLLMRequest, has_images: bool) -> str:
-        """transcript + 颜色图例(与画框颜色同源)+ 任务输出指令。"""
-        parts = [request.transcript_text]
-        if has_images and request.frame_boxes:
-            track_ids = sorted(
-                {tid for _t, entries in request.frame_boxes for tid, _box in entries}
-            )
-            if track_ids:
-                legend = ", ".join(
-                    f"id={tid} is the {color_for_track(tid)} box" for tid in track_ids
-                )
-                parts.append(f"Box color legend: {legend}.")
-        instruction = _TASK_INSTRUCTIONS.get(request.prompt_type)
-        if instruction is None:
-            raise ValueError(f"unknown prompt_type: {request.prompt_type!r}")
-        parts.append(instruction)
-        return "\n".join(parts)
+        return compose_prompt_text(
+            request.prompt_type,
+            request.transcript_text,
+            request.frame_boxes,
+            has_images,
+        )

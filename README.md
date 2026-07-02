@@ -69,13 +69,16 @@ stdlib-only; everything needing torch/transformers/opencv/PIL lives in
   Qwen3.5-2B consumes annotated key frames (per-track colored boxes +
   color legend) and answers the interaction task in structured JSON.
   BenSMOT GT trajectories stand in for the frozen tracker.
-- **Stage-1a** (learnable components + gradient gate done; training loop
-  next): `LearnableUnaryKFA` + `MLPProjector`, soft tokens injected through
-  an embedding forward hook (input_ids keep flowing through the model so
-  all internal multimodal fusion stays intact).
+- **Stage-1a** (done): `LearnableUnaryKFA` + `MLPProjector`, soft tokens
+  injected through an embedding forward hook (input_ids keep flowing
+  through the model so all internal multimodal fusion stays intact),
+  placed at the end of the user turn — before the assistant header.
   `python -m smot.ml.gradient_check` passes: loss backprops through the
   frozen LM into exactly {unary KFA, projector}, 617 frozen tensors get no
-  gradient.
+  gradient. `python -m smot.ml.training` teacher-forces all three tasks
+  through one shared CE loss (the exact same forward path the gate
+  verifies), z-scores fact embeds with dataset statistics carried inside
+  the checkpoint, and logs a per-step loss curve.
 - **Stage-1b** (future): learnable Pairwise KFA + Fact Selector slots.
 
 `Pipeline`'s constructor takes every learnable/model-backed component as an
@@ -128,6 +131,14 @@ python -m smot.datasets.bensmot stats <BenSMOT>/train -o fact_stats.json
 
 # Stage-1a acceptance gate #1 (needs the ml venv + GPU)
 .venv/Scripts/python -m smot.ml.gradient_check
+
+# Stage-1a training (frozen Qwen3.5; trains only unary KFA + projector,
+# ~2.3M params; fits the 8 GB RTX 5060). Then eval the checkpoint against
+# the M-A2 baseline via run_bensmot_real.py --checkpoint.
+.venv/Scripts/python -m smot.ml.training <BenSMOT>/train --limit 200 \
+    --out-dir out/stage1a --epochs 2
+.venv/Scripts/python examples/run_bensmot_real.py <BenSMOT>/test --limit 5 \
+    --checkpoint out/stage1a/stage1a.pt
 
 # Evaluate any pred/gold payload pair (SS7: tiered interaction F1
 # strict / synonym-merged / coarse, direction accuracy, instance coverage,

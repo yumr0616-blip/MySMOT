@@ -127,6 +127,7 @@ class Pipeline:
         frame_feature_fn: Optional[
             Callable[[Trajectory], Sequence[tuple[float, ...]]]
         ] = None,
+        fact_transform: Optional[Callable[[list[Fact]], list[Fact]]] = None,
     ):
         # tracker 没有默认值——它必须由调用方显式提供(Stage-0 下通常是
         # StubTracker 注入的 GT/预置轨迹;真正跑真实 tracker 时替换成
@@ -136,6 +137,10 @@ class Pipeline:
         # 例如 smot.frame_features.geometric_frame_features)。默认 None,
         # 此时 unary KFA 的 features 参数收到 None,保持 Stage-0 行为。
         self.frame_feature_fn = frame_feature_fn
+        # fact_transform:事实抽取之后、选择/池化之前的整体变换钩子
+        # (Stage-1a 用它注入 embed 归一化,见 smot.fact_norm;训练与
+        # 推理必须注入同一份变换)。默认 None 保持原始 embed。
+        self.fact_transform = fact_transform
         self.motion_fact_extractor = motion_fact_extractor or MotionFactExtractor()
         self.event_filter = event_filter or EventCandidateFilter()
         self.fact_selector = fact_selector or DeterministicFactSelector()
@@ -165,6 +170,8 @@ class Pipeline:
             dupes = sorted({i for i in seen_ids if seen_ids.count(i) > 1})
             raise ValueError(f"tracker 输出了重复的 track_id: {dupes}")
         facts = self.motion_fact_extractor.extract(trajectories)
+        if self.fact_transform is not None:
+            facts = self.fact_transform(facts)
         event_candidates = self.event_filter.find_candidates(trajectories)
         traj_by_id = {traj.track_id: traj for traj in trajectories}
         cost = CostReport()
