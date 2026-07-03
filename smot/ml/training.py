@@ -331,6 +331,21 @@ def train(args) -> dict:
 
     step = 0
     epoch_means: list[float] = []
+
+    def save(epoch: int) -> None:
+        save_stage1a_checkpoint(
+            out_dir / "stage1a.pt",
+            kfa,
+            projector,
+            extra={
+                "fact_stats": fact_stats,
+                "epochs": epoch,
+                "steps": step,
+                "epoch_mean_losses": epoch_means,
+                "model_id": args.model_id,
+            },
+        )
+
     with open(log_path, "w", encoding="utf-8") as log_file:
         for epoch in range(1, args.epochs + 1):
             order = list(range(len(examples)))
@@ -358,27 +373,22 @@ def train(args) -> dict:
                     + "\n"
                 )
                 if step % args.log_every == 0:
+                    log_file.flush()
                     recent = losses[-args.log_every:]
                     print(
                         f"[epoch {epoch}] step {step}: "
                         f"loss(recent mean) = {sum(recent)/len(recent):.4f}",
-                        file=sys.stderr,
+                        file=sys.stderr, flush=True,
                     )
+                # 周期性存档:长跑被环境超时/断电杀掉时,最多损失
+                # save_every 步的进度,而不是整个未完成的 epoch。
+                if args.save_every and step % args.save_every == 0:
+                    save(epoch)
             mean_loss = sum(losses) / len(losses)
             epoch_means.append(mean_loss)
-            print(f"[epoch {epoch}] mean loss = {mean_loss:.4f}", file=sys.stderr)
-            save_stage1a_checkpoint(
-                out_dir / "stage1a.pt",
-                kfa,
-                projector,
-                extra={
-                    "fact_stats": fact_stats,
-                    "epochs": epoch,
-                    "steps": step,
-                    "epoch_mean_losses": epoch_means,
-                    "model_id": args.model_id,
-                },
-            )
+            print(f"[epoch {epoch}] mean loss = {mean_loss:.4f}",
+                  file=sys.stderr, flush=True)
+            save(epoch)
 
     print(
         f"[完成] checkpoint -> {out_dir / 'stage1a.pt'};"
@@ -405,6 +415,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument("--image-max-side", type=int, default=640)
     parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument(
+        "--save-every", type=int, default=100,
+        help="每 N 步周期性保存 checkpoint(0 关闭,只在 epoch 末保存)",
+    )
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--quantize-4bit", action="store_true")
