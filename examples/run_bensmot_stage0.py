@@ -25,6 +25,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from smot.datasets.bensmot import (
+    BENSMOT_SYNONYM_MAP,
     build_gold_payloads,
     load_split,
     sequence_to_video_handle,
@@ -80,7 +81,7 @@ def main() -> int:
         )
 
     golds = build_gold_payloads(sequences)
-    metrics = evaluate(preds, golds)
+    metrics = evaluate(preds, golds, synonym_map=BENSMOT_SYNONYM_MAP)
 
     os.makedirs(args.out_dir, exist_ok=True)
     for filename, payload in (

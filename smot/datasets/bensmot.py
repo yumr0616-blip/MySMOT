@@ -20,13 +20,22 @@ BenSMOT(ECCV 2024, "Beyond MOT: Semantic Multi-Object Tracking")的
   - fact 数值统计(mean/std)—— 供 Stage-1a 前对 Fact.embed 的 norm_value
                                做数据集级归一化(设计文档记录的显式待办)
 
-两个在拿到真实数据前无法 100% 确认的格式假设(均可用 probe 子命令
-在真实数据上验证,发现偏差时只需改本模块,不影响下游):
-  1. instance_captions.txt 的行顺序 <-> gt.txt 中按升序排列的 track_id
-     一一对应(名字里的编号是按类别名各自计数的,如 woman0/man0,
-     不能直接当 track_id 用)。
-  2. interactions.graphml 的节点即实例名(或带 name 属性),边上的某个
-     字符串属性是谓词;边方向 = subject -> object。
+格式事实(2026-07 对全部 3282 段真实序列做过全量调查后确认):
+  1. instance_captions.txt 行序 <-> gt.txt 中升序排列的 track_id 一一
+     对应;95% 的序列两边数量相等,其余多为 caption 少于轨迹(背景
+     人物有轨迹无描述)——映射按 zip 截断,没有 caption 的轨迹不进
+     gold instances。
+  2. interactions.graphml 的边属性键固定为 "relationship",值是
+     WordNet synset 列表(如 "look.v.01,talk.v.01";约 1.7% 混有
+     "cooperation"/"recieve" 之类的裸词或点号笔误)。一条边拆成
+     多条断言,谓词取 synset 的 lemma;双向交互两条边各自标注。
+  3. 92.7% 序列的 graphml 节点名与 caption 实例名一致(casefold 后);
+     其余名字对不上(如 caption 写 woman0、graphml 写 man1 的标注
+     笔误)——名字全部可解析时用名字映射,否则整体退回"节点文档
+     顺序 <-> track_id 升序"的位置映射。
+  4. 帧号是稀疏采样的(1,2,4,6,...),imgs/ 的文件名数字即帧号,
+     gt.txt 只在有图像的帧上给框——Trajectory 本就支持稀疏观测。
+  5. 122 段序列缺失全部语义标注文件,--skip-errors 模式下跳过。
 
 命令行用法:
     python -m smot.datasets.bensmot probe <序列目录>          # 格式探查
@@ -39,6 +48,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -69,6 +79,35 @@ _NODE_NAME_KEY_HINTS = ("name", "label", "instance")
 # 边属性里表示交互起止帧的键名(精确匹配,避免 "restart" 之类误命中)。
 _SPAN_START_KEYS = frozenset({"start", "start_frame", "begin", "t_start", "from"})
 _SPAN_END_KEYS = frozenset({"end", "end_frame", "finish", "t_end", "to"})
+
+# §7 synonym-merged 档的合并表(对预测和 gold 同时应用)。按 gold 谓词
+# 分布(look/talk/smile/converse/listen/hold/embrace/...)把明显同义的
+# lemma 折叠到同一代表词:模型说 "chat" 而标注写 "converse"/"talk" 时,
+# strict 档记错、synonym 档应记对。表刻意保守——只合并无争议的同义词,
+# "smile"/"laugh"、"touch"/"hold" 这类近义但可区分的保持独立。
+BENSMOT_SYNONYM_MAP: dict[str, str] = {
+    "converse": "talk",
+    "chat": "talk",
+    "speak": "talk",
+    "communicate": "talk",
+    "watch": "look",
+    "observe": "look",
+    "see": "look",
+    "stare": "look",
+    "gaze": "look",
+    "hug": "embrace",
+    "cuddle": "embrace",
+    "shake hands": "handshake",
+    "cooperate": "collaborate",
+    "cooperation": "collaborate",
+    "hand": "give",
+    "pass": "give",
+    "receive": "accept",
+    "recieve": "accept",  # 标注里的真实拼写错误
+    "hear": "listen",
+    "grab": "hold",
+    "grip": "hold",
+}
 
 
 @dataclass(frozen=True)
@@ -176,18 +215,15 @@ def parse_instance_captions(path: str | os.PathLike) -> list[tuple[str, str]]:
 def map_names_to_track_ids(
     names: list[str], track_ids: list[int], context: str = ""
 ) -> dict[str, int]:
-    """实例名 -> track_id 的映射(格式假设 #1:行序 <-> id 升序)。
+    """实例名 -> track_id 的映射(格式事实 #1:行序 <-> id 升序)。
 
-    数量不一致说明假设被破坏(或标注本身缺失),fail-fast 并把两边的
-    内容都打进错误信息,方便对着 probe 输出排查。
+    数量不一致是真实数据的常态(约 5% 序列的背景人物有轨迹无 caption,
+    个别序列 caption 反而更多)——按 zip 截断:第 i 行 caption 对应第 i
+    小的 track_id,多出来的一侧丢弃。重复实例名仍然 fail-fast(那说明
+    行序映射本身不可信)。
     """
     if len(names) != len(set(names)):
         raise ValueError(f"{context}: instance_captions 中存在重复实例名: {names}")
-    if len(names) != len(track_ids):
-        raise ValueError(
-            f"{context}: 实例名数量({len(names)})与轨迹数量({len(track_ids)})"
-            f"不一致; names={names}, track_ids={sorted(track_ids)}"
-        )
     return {name: tid for name, tid in zip(names, sorted(track_ids))}
 
 
@@ -248,6 +284,34 @@ def _looks_numeric(value: str) -> bool:
         return False
 
 
+# WordNet synset 形态:lemma.词性.两位序号,如 "look.v.01"、"shake_hands.v.01"。
+_SYNSET_RE = re.compile(r"([a-zA-Z_'\-]+)\.[a-z]\.\d{2}")
+
+
+def parse_predicates(value: str) -> tuple[str, ...]:
+    """把边属性值解析成谓词元组(格式事实 #2)。
+
+    值的主体形态是逗号分隔的 synset 列表("look.v.01,talk.v.01"),
+    谓词取 lemma(下划线还原成空格);真实标注里混有约 1.7% 的脏条目:
+    裸词("cooperation"、拼错的 "recieve")原样保留(小写),
+    点号连写("clap.v.04.take.v.04")靠 findall 拆出全部 synset。
+    同一条边内去重、保持出现顺序。
+    """
+    out: list[str] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        synsets = _SYNSET_RE.findall(part)
+        if synsets:
+            out.extend(s.replace("_", " ").lower() for s in synsets)
+        else:
+            out.append(part.replace("_", " ").lower())
+    seen: set[str] = set()
+    unique = [p for p in out if not (p in seen or seen.add(p))]
+    return tuple(unique)
+
+
 def _pick_predicate(data: dict[str, str], context: str) -> str:
     """从边属性里挑出谓词字符串(格式假设 #2)。
 
@@ -294,6 +358,34 @@ def _default_pair_span(traj_a: Trajectory, traj_b: Trajectory) -> tuple[int, int
     return (lo, hi)
 
 
+def _resolve_graphml_nodes(
+    node_names: dict[str, str],
+    name_to_id: dict[str, int],
+    track_ids: list[int],
+) -> dict[str, int]:
+    """graphml 节点 id -> track_id(格式事实 #3 的两级策略)。
+
+    优先名字映射(casefold 容忍大小写/空格差异,覆盖 92.7% 的序列);
+    任何一个节点名解析失败,就整体退回位置映射:节点在文档中的出现
+    顺序 <-> track_id 升序(调查确认标注工具按人物顺序生成节点,数字
+    后缀是按类别各自计数的,不能单独当顺序用)。位置映射下节点数超出
+    轨迹数的溢出节点不进映射,引用它们的边由调用方丢弃。
+    """
+    norm = {name.strip().casefold(): tid for name, tid in name_to_id.items()}
+
+    def by_name(node_id: str) -> Optional[int]:
+        display = node_names.get(node_id, node_id) or node_id
+        return norm.get(display.strip().casefold())
+
+    resolved = {nid: by_name(nid) for nid in node_names}
+    if resolved and all(tid is not None for tid in resolved.values()):
+        return resolved  # type: ignore[return-value]
+    ordered = sorted(track_ids)
+    return {
+        nid: ordered[i] for i, nid in enumerate(node_names) if i < len(ordered)
+    }
+
+
 def graphml_to_interactions(
     path: str | os.PathLike,
     name_to_id: dict[str, int],
@@ -301,44 +393,43 @@ def graphml_to_interactions(
 ) -> tuple[InteractionAssertion, ...]:
     """把 interactions.graphml 转成 gold InteractionAssertion 元组。
 
-    - 边方向 source -> target 解释为 subject -> object;
-    - canonical_label 经 map_predicate 规范化(查不到时保留小写原文,
-      与预测侧同一套规则,保证 strict 层面能对得上);
+    - 边方向 source -> target 解释为 subject -> object,双向交互在
+      标注里本来就是两条边;
+    - 一条边的 relationship 值经 parse_predicates 拆成多个谓词,
+      每个谓词一条断言;
+    - canonical_label 经 map_predicate 规范化(synset lemma 查不到映射
+      时保留小写原文,与预测侧同一套规则,保证 strict 层能对得上);
+    - 节点解析不出 track_id(位置映射下的溢出节点)或自环的边直接
+      丢弃——那是标注对不上号的边,比错配成随机 track 更安全;
     - gold 没有"证据帧"概念,evidence_frames 置空(评测不消费该字段)。
     """
     node_names, edges = _parse_graphml(path)
-    # 名字查找统一 casefold,容忍标注在大小写/首尾空格上的不一致。
-    norm_name_to_id = {name.casefold(): tid for name, tid in name_to_id.items()}
-
-    def resolve(node_id: str, context: str) -> int:
-        display = node_names.get(node_id, node_id)
-        key = display.strip().casefold()
-        if key not in norm_name_to_id:
-            raise ValueError(
-                f"{context}: 节点 {node_id!r}(显示名 {display!r})不在实例名"
-                f"映射中;可用实例名: {sorted(name_to_id)}"
-            )
-        return norm_name_to_id[key]
+    node_to_tid = _resolve_graphml_nodes(
+        node_names, name_to_id, list(traj_by_id)
+    )
 
     assertions: list[InteractionAssertion] = []
     for index, edge in enumerate(edges):
         context = f"{path} 第 {index} 条边"
-        subject_id = resolve(edge.source, context)
-        object_id = resolve(edge.target, context)
-        predicate = _pick_predicate(edge.data, context)
+        subject_id = node_to_tid.get(edge.source)
+        object_id = node_to_tid.get(edge.target)
+        if subject_id is None or object_id is None or subject_id == object_id:
+            continue
+        value = _pick_predicate(edge.data, context)
         time_span = _span_from_edge_data(edge.data) or _default_pair_span(
             traj_by_id[subject_id], traj_by_id[object_id]
         )
-        assertions.append(
-            InteractionAssertion(
-                subject_id=subject_id,
-                object_id=object_id,
-                predicate=predicate,
-                canonical_label=map_predicate(predicate),
-                time_span=time_span,
-                evidence_frames=(),
+        for predicate in parse_predicates(value):
+            assertions.append(
+                InteractionAssertion(
+                    subject_id=subject_id,
+                    object_id=object_id,
+                    predicate=predicate,
+                    canonical_label=map_predicate(predicate),
+                    time_span=time_span,
+                    evidence_frames=(),
+                )
             )
-        )
     return tuple(assertions)
 
 
@@ -452,15 +543,20 @@ def sequence_to_gold_payload(seq: BenSMOTSequence) -> dict:
     """把一段序列的 gold 标注转成与 PipelineResult.to_json_dict() 同形的
     payload(可直接落盘、直接喂 smot.eval)。复用 §5 的断言 dataclass
     来构造,保证字段名/结构与预测侧永远同步,而不是手写第二份 schema。
+
+    gold instances 只包含有 caption 的轨迹:没有语义标注的背景人物不该
+    进 coverage 指标的分母(预测侧描述了它们也不算错,只是 gold 没有
+    可对照的内容)。
     """
     instances = [
         InstanceAssertion(
             track_id=traj.track_id,
-            caption=seq.instance_captions.get(traj.track_id, ""),
+            caption=seq.instance_captions[traj.track_id],
             time_span=traj.present,
             evidence_frames=(),  # gold 无证据帧概念,评测也不消费此字段
         ).to_json_dict()
         for traj in seq.trajectories
+        if traj.track_id in seq.instance_captions
     ]
     video = VideoAssertion(
         summary=seq.video_caption,
@@ -592,9 +688,30 @@ def describe_sequence(seq_dir: str | os.PathLike) -> str:
     def graphml_body() -> list[str]:
         node_names, edges = _parse_graphml(seq / "interactions.graphml")
         rows = [f"节点: {node_names}"]
+        entries = parse_instance_captions(seq / "instance_captions.txt")
+        trajectories = parse_gt_txt(seq / "gt" / "gt.txt")
+        name_to_id = map_names_to_track_ids(
+            [n for n, _ in entries],
+            [t.track_id for t in trajectories],
+            context=str(seq),
+        )
+        node_to_tid = _resolve_graphml_nodes(
+            node_names, name_to_id, [t.track_id for t in trajectories]
+        )
+        by_name = {
+            name.strip().casefold() for name in name_to_id
+        } >= {
+            (node_names.get(n, n) or n).strip().casefold() for n in node_names
+        }
+        rows.append(
+            f"节点->track_id 映射({'名字匹配' if by_name else '位置回退'}): "
+            f"{node_to_tid}"
+        )
         for i, edge in enumerate(edges[:10]):
+            value = _pick_predicate(edge.data, f"边[{i}]")
             rows.append(
-                f"边[{i}]: {edge.source} -> {edge.target}, 属性 {edge.data}"
+                f"边[{i}]: {edge.source} -> {edge.target}, 原始 {value!r} "
+                f"-> 谓词 {list(parse_predicates(value))}"
             )
         if len(edges) > 10:
             rows.append(f"... 共 {len(edges)} 条边")

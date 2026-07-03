@@ -141,16 +141,29 @@ class BenSMOTConverterTest(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_caption_mapping_line_order(self):
-        """格式假设 #1:caption 行序 <-> track_id 升序。"""
+        """格式事实 #1:caption 行序 <-> track_id 升序。"""
         mapping = map_names_to_track_ids(["man0", "woman0"], [2, 1])
         self.assertEqual(mapping, {"man0": 1, "woman0": 2})
 
-    def test_caption_count_mismatch_raises(self):
+    def test_caption_fewer_than_tracks_truncates(self):
+        """真实数据常态:背景人物有轨迹无 caption,按 zip 截断映射到
+        最小的 track_id;无 caption 的轨迹不进 gold instances。"""
+        mapping = map_names_to_track_ids(["man0"], [3, 1, 2])
+        self.assertEqual(mapping, {"man0": 1})
         (self.seq_dir / "instance_captions.txt").write_text(
             "man0: only one line.\n", encoding="utf-8"
         )
+        (self.seq_dir / "interactions.graphml").write_text(
+            _GRAPHML.replace("woman0", "man1"), encoding="utf-8"
+        )
+        seq = load_sequence(self.seq_dir)
+        self.assertEqual(list(seq.instance_captions), [1])
+        payload = build_gold_payloads([seq])[0]
+        self.assertEqual([i["track_id"] for i in payload["instances"]], [1])
+
+    def test_duplicate_caption_names_raise(self):
         with self.assertRaises(ValueError):
-            load_sequence(self.seq_dir)
+            map_names_to_track_ids(["man0", "man0"], [1, 2])
 
     # ------------------------------------------------------------------
     # interactions.graphml
@@ -182,12 +195,59 @@ class BenSMOTConverterTest(unittest.TestCase):
         self.assertEqual(assertions[0].time_span, (2, 3))
         self.assertEqual((assertions[0].subject_id, assertions[0].object_id), (1, 2))
 
-    def test_graphml_unknown_node_raises(self):
-        graphml = _GRAPHML.replace('source="man0"', 'source="ghost0"')
+    def test_graphml_unmatched_names_fall_back_to_positional(self):
+        """格式事实 #3:节点名与 caption 名对不上(标注笔误,如 caption
+        写 woman0、graphml 写 man1)时,按文档顺序映射到 track_id 升序。"""
+        graphml = _GRAPHML.replace("woman0", "man1")  # 节点变成 man0/man1
         (self.seq_dir / "interactions.graphml").write_text(graphml, encoding="utf-8")
-        with self.assertRaises(ValueError) as ctx:
-            load_sequence(self.seq_dir)
-        self.assertIn("ghost0", str(ctx.exception))
+        seq = load_sequence(self.seq_dir)
+        self.assertEqual(len(seq.interactions), 1)
+        # 文档顺序 man0, man1 -> track 1, 2。
+        self.assertEqual(
+            (seq.interactions[0].subject_id, seq.interactions[0].object_id), (1, 2)
+        )
+
+    def test_graphml_overflow_node_edges_dropped(self):
+        """位置映射下溢出轨迹数的节点,引用它的边被丢弃而不是错配。"""
+        graphml = _GRAPHML.replace(
+            '<node id="woman0"/>',
+            '<node id="ghostA"/>\n    <node id="ghostB"/>',
+        ).replace('target="woman0"', 'target="ghostB"')
+        (self.seq_dir / "interactions.graphml").write_text(graphml, encoding="utf-8")
+        seq = load_sequence(self.seq_dir)  # 3 节点、2 轨迹:ghostB 溢出
+        self.assertEqual(seq.interactions, ())
+
+    def test_parse_predicates_synset_lists(self):
+        """格式事实 #2:synset 列表、点号笔误、裸词、去重。"""
+        from smot.datasets.bensmot import parse_predicates
+
+        self.assertEqual(
+            parse_predicates("look.v.01,talk.v.01,return.v.06"),
+            ("look", "talk", "return"),
+        )
+        # 点号连写笔误:findall 拆出两个 synset。
+        self.assertEqual(
+            parse_predicates("clap.v.04.take.v.04"), ("clap", "take")
+        )
+        # 裸词保留(小写);下划线还原空格;重复去掉。
+        self.assertEqual(
+            parse_predicates("talk.v.01,cooperation,shake_hands.v.01,talk.v.01"),
+            ("talk", "cooperation", "shake hands"),
+        )
+        self.assertEqual(parse_predicates(""), ())
+
+    def test_graphml_multi_predicate_edge_expands(self):
+        """一条边的 synset 列表拆成多条断言,方向一致。"""
+        graphml = _GRAPHML.replace(
+            "<data key=\"d0\">walks towards</data>",
+            "<data key=\"d0\">look.v.01,talk.v.01</data>",
+        )
+        (self.seq_dir / "interactions.graphml").write_text(graphml, encoding="utf-8")
+        seq = load_sequence(self.seq_dir)
+        self.assertEqual(
+            [(a.subject_id, a.object_id, a.predicate) for a in seq.interactions],
+            [(1, 2, "look"), (1, 2, "talk")],
+        )
 
     # ------------------------------------------------------------------
     # gold payload / 统计 / VideoHandle

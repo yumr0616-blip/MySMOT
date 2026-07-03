@@ -32,24 +32,32 @@ _NEGATION_WORDS = frozenset(
 UNVERIFIED_DIRECTION_CONFIDENCE = 0.5
 
 
-def _find_structured_interaction(text: str) -> Optional[dict]:
-    """在 MLLM 输出里找出第一个带 "predicate" 键的 JSON 对象。
+def _is_interaction_item(obj) -> bool:
+    return isinstance(obj, dict) and "predicate" in obj
 
-    真实 MLLM 被要求以结构化 JSON 回答交互任务,但模型经常在 JSON 前后
-    加解释文字或 ```json 围栏,所以不能直接 json.loads 整段文本——从每个
-    '{' 起尝试 raw_decode(它能正确处理字符串里的花括号),找到第一个
-    解析成功且含 predicate 键的对象为止。找不到返回 None,调用方退回
-    自由文本谓词抽取路径(Mock 和不守指令的模型都走那条路)。
+
+def _find_structured_interactions(text: str) -> Optional[list[dict]]:
+    """在 MLLM 输出里找出结构化的交互 JSON,统一返回对象列表。
+
+    真实 MLLM 被要求以 JSON 数组回答交互任务(一对目标可能同时存在
+    多条有向交互),但模型经常在 JSON 前后加解释文字或 ```json 围栏,
+    也可能退化成单个对象,所以不能直接 json.loads 整段文本——从每个
+    '[' 或 '{' 起尝试 raw_decode(它能正确处理字符串里的括号),按:
+      - 解析出数组且所有元素都是带 predicate 键的对象 -> 原样返回
+        (空数组 [] 是模型明确的"无交互"信号,返回空列表);
+      - 解析出带 predicate 键的单个对象 -> 包成单元素列表;
+    找不到返回 None,调用方退回自由文本谓词抽取路径(Mock 和不守
+    指令的模型都走那条路)。
     """
-    idx = text.find("{")
-    while idx != -1:
+    for idx in (i for i, ch in enumerate(text) if ch in "[{"):
         try:
             obj, _ = _JSON_DECODER.raw_decode(text, idx)
         except json.JSONDecodeError:
-            obj = None
-        if isinstance(obj, dict) and "predicate" in obj:
-            return obj
-        idx = text.find("{", idx + 1)
+            continue
+        if isinstance(obj, list) and all(_is_interaction_item(o) for o in obj):
+            return list(obj)
+        if _is_interaction_item(obj):
+            return [obj]
     return None
 
 
@@ -145,36 +153,102 @@ class OutputAssembler:
         evidence_frames: tuple[int, ...],
         confidence: float = 1.0,
     ) -> InteractionAssertion:
-        """交互断言:结构化 JSON 优先,自由文本谓词抽取兜底。
-
-        真实 MLLM 被要求以 JSON({"subject_id", "object_id", "predicate",
-        "sentence"})回答交互任务:能解析到带 predicate 键的 JSON 对象时,
-        谓词直接取字段值(不再做短语匹配),方向按模型声明的 id 对账;
-        解析不到(Mock、或模型没守指令)时退回原有的正则 + 已知短语
-        最长匹配路径。两条路径的方向对账规则完全相同(见
-        _reconcile_direction),direction 字段固定为 "subj->obj"
-        (即最终的 subject_id 是动作发出方)。
+        """单断言入口(兼容旧调用方/测试):取 assemble_interactions 的
+        第一条;模型明确回答"无交互"(空数组)时按文本兜底路径产出
+        一条低置信断言,保证本方法总有返回值。
         """
-        structured = _find_structured_interaction(mllm_text)
-        if structured is not None:
-            stated_subj = _as_int(structured.get("subject_id"))
-            stated_obj = _as_int(structured.get("object_id"))
+        assertions = self.assemble_interactions(
+            subject_id, object_id, mllm_text, time_span, evidence_frames, confidence
+        )
+        if assertions:
+            return assertions[0]
+        return self._assemble_from_text(
+            subject_id, object_id, mllm_text, time_span, evidence_frames, confidence
+        )
+
+    def assemble_interactions(
+        self,
+        subject_id: int,
+        object_id: int,
+        mllm_text: str,
+        time_span: tuple[int, int],
+        evidence_frames: tuple[int, ...],
+        confidence: float = 1.0,
+    ) -> tuple[InteractionAssertion, ...]:
+        """交互断言(复数):结构化 JSON 数组优先,自由文本谓词抽取兜底。
+
+        真实 MLLM 被要求以 JSON 数组回答交互任务(每项 {"subject_id",
+        "object_id", "predicate"}),因为一对目标往往同时存在多条有向
+        交互(A 递钱给 B 的同时两人在交谈)——BenSMOT 的 gold 平均每对
+        4+ 条有向断言,单断言输出的召回上限只有 ~25%。
+
+        解析到数组时逐项组装(谓词直接取字段值,方向按各项声明的 id
+        对账);空数组是模型明确的"无交互"信号,返回空元组;解析不到
+        任何 JSON(Mock、或模型没守指令)时退回正则 + 已知短语最长匹配
+        的文本路径,产出单条断言。同一 (subject, object, predicate) 的
+        重复项去重。所有路径的方向对账规则相同(_reconcile_direction),
+        direction 字段固定为 "subj->obj"(最终 subject_id 是动作发出方)。
+        """
+        structured = _find_structured_interactions(mllm_text)
+        if structured is None:
+            return (
+                self._assemble_from_text(
+                    subject_id, object_id, mllm_text, time_span,
+                    evidence_frames, confidence,
+                ),
+            )
+
+        assertions: list[InteractionAssertion] = []
+        seen: set[tuple[int, int, str]] = set()
+        for item in structured:
+            predicate = str(item["predicate"]).strip()
+            if not predicate:
+                continue
+            stated_subj = _as_int(item.get("subject_id"))
+            stated_obj = _as_int(item.get("object_id"))
             stated = (
                 (stated_subj, stated_obj)
                 if stated_subj is not None and stated_obj is not None
                 else None
             )
-            predicate = str(structured["predicate"]).strip()
-        else:
-            subj_match = _SUBJECT_ID_RE.search(mllm_text)
-            obj_match = _OBJECT_ID_RE.search(mllm_text)
-            stated = (
-                (int(subj_match.group(1)), int(obj_match.group(1)))
-                if subj_match and obj_match
-                else None
+            subj, obj, conf = _reconcile_direction(
+                stated, subject_id, object_id, confidence
             )
-            predicate = _extract_predicate(mllm_text, self.canonical_map)
+            key = (subj, obj, predicate.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            assertions.append(
+                InteractionAssertion(
+                    subject_id=subj,
+                    object_id=obj,
+                    predicate=predicate,
+                    canonical_label=map_predicate(predicate, self.canonical_map),
+                    time_span=time_span,
+                    evidence_frames=evidence_frames,
+                    confidence=conf,
+                )
+            )
+        return tuple(assertions)
 
+    def _assemble_from_text(
+        self,
+        subject_id: int,
+        object_id: int,
+        mllm_text: str,
+        time_span: tuple[int, int],
+        evidence_frames: tuple[int, ...],
+        confidence: float,
+    ) -> InteractionAssertion:
+        """自由文本兜底路径(旧行为原样保留)。"""
+        subj_match = _SUBJECT_ID_RE.search(mllm_text)
+        obj_match = _OBJECT_ID_RE.search(mllm_text)
+        stated = (
+            (int(subj_match.group(1)), int(obj_match.group(1)))
+            if subj_match and obj_match
+            else None
+        )
+        predicate = _extract_predicate(mllm_text, self.canonical_map)
         subject_id, object_id, confidence = _reconcile_direction(
             stated, subject_id, object_id, confidence
         )

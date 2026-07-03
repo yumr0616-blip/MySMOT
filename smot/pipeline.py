@@ -179,9 +179,14 @@ class Pipeline:
         instances = tuple(
             self._run_instance(traj, facts, video, cost) for traj in trajectories
         )
+        # 一条候选边可能产出多条有向交互断言(真实 MLLM 以 JSON 数组
+        # 回答;空数组 = 模型确认无交互,该边不产断言),拍平汇总。
         interactions = tuple(
-            self._run_interaction(candidate, facts, traj_by_id, video, cost)
+            assertion
             for candidate in event_candidates
+            for assertion in self._run_interaction(
+                candidate, facts, traj_by_id, video, cost
+            )
         )
         video_assertion = self._run_video(trajectories, facts, video, cost)
 
@@ -251,7 +256,7 @@ class Pipeline:
 
     def _run_interaction(
         self, candidate, facts, traj_by_id, video, cost: CostReport
-    ) -> InteractionAssertion:
+    ) -> tuple[InteractionAssertion, ...]:
         """针对一条候选交互边:构造逐帧 pair 特征 -> 选 pair 事实 ->
         选双方关键帧 -> 池化+投影出 soft token -> 组 prompt -> 问 MLLM ->
         组装成断言。time_span 取选中证据帧的最小值到最大值(候选帧本身
@@ -299,7 +304,7 @@ class Pipeline:
         )
         mllm_text = self._generate(request, cost)
         time_span = (min(frames), max(frames)) if frames else (0, 0)
-        return self.output_assembler.assemble_interaction(
+        return self.output_assembler.assemble_interactions(
             subject_id=subject_id,
             object_id=object_id,
             mllm_text=mllm_text,

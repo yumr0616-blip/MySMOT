@@ -40,11 +40,13 @@ _TASK_INSTRUCTIONS = {
         "highlighted target's visible behavior."
     ),
     "interaction": (
-        "Decide who acts on whom. Respond with ONLY a JSON object and no "
-        'other text: {"subject_id": <int, the actor>, "object_id": <int, '
-        'the target>, "predicate": "<short verb phrase>", "sentence": '
-        '"<one English sentence>"}. Use the integer ids shown on the box '
-        "labels."
+        "List every interaction you can verify between the two highlighted "
+        "people. Respond with ONLY a JSON array, no other text. Each item: "
+        '{"subject_id": <int, the actor>, "object_id": <int, the target>, '
+        '"predicate": "<ONE English verb in base form, e.g. talk, look, '
+        'give, push, hold>"}. Use the integer ids shown on the box labels; '
+        "include one item per verb per direction that applies (both "
+        "directions may appear); respond [] if no interaction is visible."
     ),
     "video": (
         "Answer with one or two concise English sentences summarizing what "

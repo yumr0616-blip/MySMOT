@@ -125,35 +125,45 @@ def build_examples(
                 )
             )
 
-        # ---- interaction:每条 gold 交互一条样本,目标是结构化 JSON ----
+        # ---- interaction:每个无序目标对一条样本,目标是该对全部有向
+        # gold 断言的 JSON 数组——与推理侧的输出契约(assemble_interactions
+        # 解析的数组)完全同构,一次请求学会"列出这一对的所有交互"。----
         traj_by_id = {traj.track_id: traj for traj in trajectories}
+        by_pair: dict[tuple[int, int], list] = {}
         for inter in seq.interactions:
-            subject, obj = inter.subject_id, inter.object_id
+            key = tuple(sorted((inter.subject_id, inter.object_id)))
+            by_pair.setdefault(key, []).append(inter)
+        for (lo, hi), inters in by_pair.items():
             common_ts = sorted(
-                {fp.t for fp in traj_by_id[subject].per_frame}
-                & {fp.t for fp in traj_by_id[obj].per_frame}
+                {fp.t for fp in traj_by_id[lo].per_frame}
+                & {fp.t for fp in traj_by_id[hi].per_frame}
             )
-            lo, hi = sorted((subject, obj))
             pooled, transcript = pooled_for(f"pair:{lo},{hi}")
+            # subject/object 的 prompt 顺序沿用第一条 gold 的方向(推理时
+            # 是候选边顺序;方向语义靠数组项里的 id 表达,与顺序解耦)。
+            first = inters[0]
             target = json.dumps(
-                {
-                    "subject_id": subject,
-                    "object_id": obj,
-                    "predicate": inter.predicate,
-                    "sentence": f"subject_id={subject} {inter.predicate} "
-                    f"object_id={obj}.",
-                },
+                [
+                    {
+                        "subject_id": inter.subject_id,
+                        "object_id": inter.object_id,
+                        "predicate": inter.predicate,
+                    }
+                    for inter in inters
+                ],
                 ensure_ascii=False,
             )
             examples.append(
                 _Example(
                     task="interaction",
                     seq=seq,
-                    prompt_body=build_interaction_prompt(subject, obj, transcript),
+                    prompt_body=build_interaction_prompt(
+                        first.subject_id, first.object_id, transcript
+                    ),
                     pooled_facts=pooled,
                     target_text=target,
                     static_frame_ts=_evenly_spaced(common_ts, pair_top_k),
-                    box_track_ids=(subject, obj),
+                    box_track_ids=(lo, hi),
                 )
             )
 
