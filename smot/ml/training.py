@@ -185,7 +185,12 @@ def build_examples(
 
 class _FrameRenderer:
     """按序列缓存帧提供者;imgs 目录缺失时静默退化为纯文本样本
-    (合成 fixture 没有图像,真实 BenSMOT 一定有)。"""
+    (合成 fixture 没有图像,真实 BenSMOT 一定有)。
+
+    每个提供者的帧 LRU 压到 2:样本是跨序列 shuffle 的,帧缓存命中率
+    本来就低,而全尺寸解码帧很大(1080p RGB ≈ 6MB/帧)——默认 32 帧
+    × 上百个序列曾把训练进程 RAM 吹到数 GB。JPEG 重复解码只是毫秒级,
+    宁可重解码。"""
 
     def __init__(self, max_side: int = 640):
         self._providers: dict[str, Optional[ImageDirFrameProvider]] = {}
@@ -196,7 +201,9 @@ class _FrameRenderer:
         if provider is _MISSING:
             imgs_dir = Path(seq.seq_dir) / "imgs"
             provider = (
-                ImageDirFrameProvider(imgs_dir) if imgs_dir.is_dir() else None
+                ImageDirFrameProvider(imgs_dir, cache_size=2)
+                if imgs_dir.is_dir()
+                else None
             )
             self._providers[seq.seq_dir] = provider
         if provider is None:
@@ -331,6 +338,7 @@ def train(args) -> dict:
 
     step = 0
     epoch_means: list[float] = []
+    empty_cache_every = 20  # 周期清空 CUDA 缓存分配器,缓解变长样本的碎片化
 
     def save(epoch: int) -> None:
         save_stage1a_checkpoint(
@@ -346,7 +354,9 @@ def train(args) -> dict:
             },
         )
 
-    with open(log_path, "w", encoding="utf-8") as log_file:
+    # buffering=1(行缓冲):每条 loss 记录立刻落盘,外部监控/断点续查
+    # 才能看到真实进度(块缓冲曾让日志停在 flush 点,掩盖了停摆位置)。
+    with open(log_path, "w", encoding="utf-8", buffering=1) as log_file:
         for epoch in range(1, args.epochs + 1):
             order = list(range(len(examples)))
             rng.shuffle(order)
@@ -372,8 +382,13 @@ def train(args) -> dict:
                     )
                     + "\n"
                 )
+                # 变长多模态样本在 8GB 卡上会让缓存分配器逐步碎片化,
+                # 顶到显存上限后 WDDM 把溢出页搬到系统内存,单步会从
+                # 秒级劣化到分钟级(实测停摆)——周期性清空缓存换一点
+                # 重分配开销,保持峰值远离天花板。
+                if step % empty_cache_every == 0 and device.startswith("cuda"):
+                    torch.cuda.empty_cache()
                 if step % args.log_every == 0:
-                    log_file.flush()
                     recent = losses[-args.log_every:]
                     print(
                         f"[epoch {epoch}] step {step}: "
