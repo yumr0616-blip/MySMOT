@@ -167,9 +167,16 @@ def parse_gt_txt(path: str | os.PathLike) -> tuple[Trajectory, ...]:
                 raise ValueError(f"{path}:{line_no}: 无法解析 gt 行: {line!r}") from exc
             if consider == 0.0:
                 continue
+            # 真实标注里约 90 行(全量扫描确认)宽/高为负值——框拟合工具
+            # 偶发的角点错序,不是转换器能预判的格式假设。按 min/max
+            # 归一化角点(而非原样传播 x2<x1 的退化框):后续任何按
+            # (x1,y1,x2,y2) 假设作画/求交/求 IoU 的代码都默认框合法,
+            # 不归一化会在 PIL 画框时 ValueError,或让 IoU/距离静默算错。
+            x1, x2 = (x, x + w) if w >= 0 else (x + w, x)
+            y1, y2 = (y, y + h) if h >= 0 else (y + h, y)
             per_frame = rows_by_id.setdefault(track_id, {})
             per_frame.setdefault(
-                t, FramePresence(t=t, box=(x, y, x + w, y + h), conf=conf)
+                t, FramePresence(t=t, box=(x1, y1, x2, y2), conf=conf)
             )
     trajectories = []
     for track_id in sorted(rows_by_id):

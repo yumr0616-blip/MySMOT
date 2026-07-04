@@ -130,6 +130,24 @@ class BenSMOTConverterTest(unittest.TestCase):
         self.assertEqual(traj1.frame_at(1).conf, 1.0)
         self.assertEqual(traj2.frame_at(1).conf, 0.5)
 
+    def test_parse_gt_negative_wh_normalized(self):
+        """真实数据里约 90 行宽/高为负(框拟合工具角点错序);框必须按
+        min/max 归一化,而不是原样传播成 x2<x1/y2<y1 的退化框(会让
+        PIL 画框炸 ValueError,IoU/距离等下游几何计算也会静默算错)。"""
+        bad = self.root / "negative_wh.txt"
+        bad.write_text(
+            "1,1,10.0,20.0,-5.0,8.0\n"  # w<0: x1 应变成 x+w=5, x2=10
+            "2,1,10.0,20.0,5.0,-8.0\n",  # h<0: y1 应变成 y+h=12, y2=20
+            encoding="utf-8",
+        )
+        trajectories = parse_gt_txt(bad)
+        box1 = trajectories[0].frame_at(1).box
+        box2 = trajectories[0].frame_at(2).box
+        self.assertEqual(box1, (5.0, 20.0, 10.0, 28.0))
+        self.assertEqual(box2, (10.0, 12.0, 15.0, 20.0))
+        self.assertTrue(box1[2] >= box1[0] and box1[3] >= box1[1])
+        self.assertTrue(box2[2] >= box2[0] and box2[3] >= box2[1])
+
     def test_parse_gt_bad_line_raises(self):
         bad = self.root / "bad_gt.txt"
         bad.write_text("1,1,not_a_number,0,10,10\n", encoding="utf-8")
