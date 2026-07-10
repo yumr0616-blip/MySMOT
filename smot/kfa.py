@@ -83,6 +83,12 @@ class PairwiseKFA(Protocol):
     candidate_frames 对齐(观测缺失的候选帧会被跳过),携带两方视觉
     特征和确定性相对几何——这是 pairwise slot 打分方向性的信息来源,
     缺了它 pairwise 选择会退化成两个 unary 特征的拼接。
+
+    features 是 pair_features 的定长向量化(与 pair_features 逐帧对齐,
+    由 Pipeline 经注入的 pair_feature_fn 构造,见 smot.pair_features.
+    pair_feature_vectors)——与 Unary KFA 的 features 参数完全同一种
+    角色:打分 MLP 消费的是它,PairFeature 对象只负责携带帧号等元信息。
+    未注入时为 None,NoOp 实现不使用。
     """
 
     def select(
@@ -91,6 +97,7 @@ class PairwiseKFA(Protocol):
         event_candidate: EventCandidate,
         top_k: int,
         pair_features: Sequence[PairFeature] = (),
+        features: Optional[Sequence[tuple[float, ...]]] = None,
     ) -> KeyFrameSelection: ...
 
 
@@ -125,6 +132,7 @@ class NoOpPairwiseKFA:
         event_candidate: EventCandidate,
         top_k: int,
         pair_features: Sequence[PairFeature] = (),
+        features: Optional[Sequence[tuple[float, ...]]] = None,
     ) -> KeyFrameSelection:
         chosen = _evenly_spaced(event_candidate.candidate_frames, top_k)
         return KeyFrameSelection(key_frames=chosen, soft_token=None)

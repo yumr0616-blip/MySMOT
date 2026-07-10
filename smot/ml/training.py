@@ -1,25 +1,32 @@
-"""Stage-1a 训练循环(M-B2):在 BenSMOT 上教师强制训练 {unary KFA, projector}。
+"""Stage-1b 训练循环(M-B3):在 BenSMOT 上教师强制训练全部四个可学习
+槽位 {unary KFA, pairwise KFA, fact selector, projector}。
 
 对应 §6 的训练配方:
   - 冻结件:MLLM 主体 + 视觉塔(load_frozen_qwen 保证 requires_grad=False
-    + eval());可训练的只有 LearnableUnaryKFA 和 MLPProjector;
+    + eval());可训练的只有四个小模块(合计 ~2.3M 参数);
   - 单一 CE loss,三种任务(instance / interaction / video)共享同一个
     LM head,只靠 prompt 措辞区分——没有任何独立输出头;
   - 前向组装复用 teacher_forced_loss(与梯度门禁完全同一条路径)与
     compose_prompt_text(与推理适配器完全同一份 prompt 组装);
-  - instance 任务的证据帧来自当前 KFA 的 hard top-k(随训练演进),
-    soft 读出向量拼接事实池化进 projector——梯度经 soft 通路回传,
-    hard 选帧"搭便车";interaction/video 任务没有 unary soft 向量,
-    KFA 分量按零补齐(与推理侧 projector.project 的补零语义一致);
+  - projector 输入是 [fact | unary | pairwise] 槽位布局(与
+    smot.pipeline._compose_pooled 的推理侧布局同一契约,由单元测试
+    锁住):本任务不产出的槽位显式补零;
+  - fact selector 每步在线跑:soft 读出占 fact 槽位(梯度通路),
+    hard top-k 渲染 transcript 进 prompt(离散,随训练演进)——
+    transcript 文本不再是样本构造期固定的;
+  - instance 证据帧来自 unary KFA 的 hard top-k,interaction 证据帧
+    来自 pairwise KFA 的 hard top-k(帧候选与推理侧同源:优先用与
+    run_bensmot_real 同配置的 EventCandidateFilter 触发帧,gold 对
+    没有触发候选时退回双方共同观测帧);
   - Fact.embed 的 norm_value 分量用训练集统计量 z-score(smot.fact_norm),
     统计量随 checkpoint 一起保存,推理侧取回后做同一变换。
 
 产出(--out-dir):
-    stage1a.pt        checkpoint(权重 + 构造配置 + fact 统计量)
+    stage1b.pt        checkpoint(四模块权重 + 构造配置 + fact 统计量)
     loss_log.jsonl    每步一行 {"step", "epoch", "task", "loss"}
 
 用法:
-    python -m smot.ml.training <BenSMOT根目录> --out-dir out/stage1a \
+    python -m smot.ml.training <BenSMOT根目录> --out-dir out/stage1b \
         [--limit N] [--epochs 2] [--lr 1e-4] [--max-frames 2] [...]
 """
 from __future__ import annotations
@@ -40,12 +47,19 @@ from smot.datasets.bensmot import (
     compute_fact_statistics,
     load_split,
 )
+from smot.event_filter import EventCandidateFilter, adaptive_proximity_gate
 from smot.fact_norm import make_fact_embed_normalizer
-from smot.fact_selector import DeterministicFactSelector, SelectionContext
+from smot.fact_selector import render_fact, scoped_facts
 from smot.frame_features import geometric_frame_features
-from smot.kfa import _evenly_spaced
-from smot.ml.checkpoint import save_stage1a_checkpoint
+from smot.ml.checkpoint import save_stage1b_checkpoint
+from smot.ml.fact_selector import (
+    LearnableFactSelector,
+    fact_priority_indices,
+    fact_scoring_features,
+    order_selected,
+)
 from smot.ml.frames import ImageDirFrameProvider, annotate_boxes
+from smot.ml.pairwise_kfa import LearnablePairwiseKFA
 from smot.ml.projector import MLPProjector
 from smot.ml.qwen_adapter import (
     DEFAULT_MODEL_ID,
@@ -55,7 +69,7 @@ from smot.ml.qwen_adapter import (
 )
 from smot.ml.unary_kfa import LearnableUnaryKFA
 from smot.motion_facts import MotionFactExtractor
-from smot.pipeline import _pool_embeds
+from smot.pair_features import build_pair_features, pair_feature_vectors
 from smot.prompts import (
     build_instance_prompt,
     build_interaction_prompt,
@@ -65,31 +79,33 @@ from smot.prompts import (
 
 @dataclass
 class _Example:
-    """一条训练样本。instance 任务带逐帧特征(KFA 每步重新选帧);
-    interaction/video 的证据帧在构造时固定。"""
+    """一条训练样本。prompt 文本不再在构造期固定——事实 transcript 由
+    fact selector 每步在线选出,这里只携带"可供选择的原料"。"""
 
     task: str  # "instance" | "interaction" | "video"
     seq: BenSMOTSequence  # 该样本所属的完整序列(渲染帧时需要访问 imgs/ 目录)
-    prompt_body: str  # prompts.py 构造的任务 prompt(不含图例/指令后缀)
-    pooled_facts: tuple[float, ...]  # 4 维事实池化(已归一化)
     target_text: str  # 教师强制的目标句(gold caption/JSON/summary)
-    # instance 专用
+    prompt_ids: tuple[int, ...]  # prompt 里出现的 id:instance=(tid,);
+    # interaction=(subject_id, object_id);video=involved_ids
+    # ---- 事实选择原料(scope 内全部事实,selector 每步从中选) ----
+    fact_feats: tuple[tuple[float, ...], ...]  # (N, FACT_SCORE_DIM) 打分特征
+    fact_texts: tuple[str, ...]  # 每条渲染好的 transcript 片段(与 fact_feats 对齐)
+    fact_priorities: tuple[int, ...]  # 每条的类型优先级下标(渲染排序用)
+    # ---- instance 专用 ----
     track_id: Optional[int] = None  # 描述哪个目标(仅 instance 任务)
-    features: tuple[tuple[float, ...], ...] = ()  # 该轨迹逐帧几何特征,喂给 KFA 打分
-    # interaction 专用(固定证据帧;video 两者皆空)
-    static_frame_ts: tuple[int, ...] = ()  # 预先算好的证据帧号(interaction 不跑 KFA 选帧)
+    features: tuple[tuple[float, ...], ...] = ()  # 逐帧几何特征,喂给 unary KFA 打分
+    # ---- interaction 专用 ----
+    pair_feats: tuple[tuple[float, ...], ...] = ()  # (T, PAIR_FEATURE_DIM) 向量化 pair 特征
+    pair_ts: tuple[int, ...] = ()  # 与 pair_feats 对齐的帧号(hard 选帧 -> 帧号)
     box_track_ids: tuple[int, ...] = ()  # 需要画框的 track_id(instance 是自己,interaction 是双方)
 
 
 def build_examples(
     sequences: list[BenSMOTSequence],
     fact_stats: dict,
-    fact_top_k: int = 6,
-    pair_top_k: int = 2,
 ) -> list[_Example]:
     """把转换后的序列展开成三类训练样本(gold 文本缺失的条目跳过)。"""
     extractor = MotionFactExtractor()
-    selector = DeterministicFactSelector()
     normalize = make_fact_embed_normalizer(fact_stats)
     examples: list[_Example] = []
 
@@ -97,14 +113,21 @@ def build_examples(
         trajectories = list(seq.trajectories)
         facts = normalize(extractor.extract(trajectories))
         t_max = max(traj.present[1] for traj in trajectories)
+        # 与推理侧(run_bensmot_real.py)完全同配置的事件过滤器:训练时
+        # pairwise KFA 看到的候选帧分布必须与推理一致,否则打分器学到的
+        # 是另一种帧分布。
+        candidates = EventCandidateFilter(
+            proximity_gate=adaptive_proximity_gate(trajectories),
+            proximity_trigger=True,
+        ).find_candidates(trajectories)
+        cand_frames = {c.edge: c.candidate_frames for c in candidates}
 
-        def pooled_for(scope: str) -> tuple[float, ...]:
-            selection = selector.select(
-                facts, SelectionContext(scope=scope, top_k=fact_top_k)
-            )
+        def fact_bundle(scope: str):
+            scoped = scoped_facts(facts, scope)
             return (
-                _pool_embeds(tuple(selection.selected_facts)) or (0.0,) * 4,
-                selection.text,
+                fact_scoring_features(scoped),
+                tuple(render_fact(f) for f in scoped),
+                fact_priority_indices(scoped),
             )
 
         # ---- instance:每条有 gold caption 的轨迹一条样本 ----
@@ -112,14 +135,16 @@ def build_examples(
             caption = seq.instance_captions.get(traj.track_id, "").strip()
             if not caption or not traj.per_frame:
                 continue
-            pooled, transcript = pooled_for(f"instance:{traj.track_id}")
+            feats, texts, priors = fact_bundle(f"instance:{traj.track_id}")
             examples.append(
                 _Example(
                     task="instance",
                     seq=seq,
-                    prompt_body=build_instance_prompt(traj.track_id, transcript),
-                    pooled_facts=pooled,
                     target_text=caption,
+                    prompt_ids=(traj.track_id,),
+                    fact_feats=feats,
+                    fact_texts=texts,
+                    fact_priorities=priors,
                     track_id=traj.track_id,
                     features=geometric_frame_features(traj, t_max=t_max),
                 )
@@ -134,11 +159,17 @@ def build_examples(
             key = tuple(sorted((inter.subject_id, inter.object_id)))
             by_pair.setdefault(key, []).append(inter)
         for (lo, hi), inters in by_pair.items():
-            common_ts = sorted(
-                {fp.t for fp in traj_by_id[lo].per_frame}
-                & {fp.t for fp in traj_by_id[hi].per_frame}
-            )
-            pooled, transcript = pooled_for(f"pair:{lo},{hi}")
+            # 帧候选与推理同源:事件过滤器触发帧优先(edge 已按 i<j 排序,
+            # 与 (lo, hi) 直接可比);gold 对未被过滤器命中时退回双方共同
+            # 观测帧(不丢训练样本——评测的召回上限不该由过滤器决定)。
+            frames_source = cand_frames.get((lo, hi))
+            if not frames_source:
+                frames_source = sorted(
+                    {fp.t for fp in traj_by_id[lo].per_frame}
+                    & {fp.t for fp in traj_by_id[hi].per_frame}
+                )
+            pfs = build_pair_features(traj_by_id[lo], traj_by_id[hi], frames_source)
+            feats, texts, priors = fact_bundle(f"pair:{lo},{hi}")
             # subject/object 的 prompt 顺序沿用第一条 gold 的方向(推理时
             # 是候选边顺序;方向语义靠数组项里的 id 表达,与顺序解耦)。
             first = inters[0]
@@ -157,12 +188,13 @@ def build_examples(
                 _Example(
                     task="interaction",
                     seq=seq,
-                    prompt_body=build_interaction_prompt(
-                        first.subject_id, first.object_id, transcript
-                    ),
-                    pooled_facts=pooled,
                     target_text=target,
-                    static_frame_ts=_evenly_spaced(common_ts, pair_top_k),
+                    prompt_ids=(first.subject_id, first.object_id),
+                    fact_feats=feats,
+                    fact_texts=texts,
+                    fact_priorities=priors,
+                    pair_feats=pair_feature_vectors(pfs, t_max=t_max),
+                    pair_ts=tuple(pf.t for pf in pfs),
                     box_track_ids=(lo, hi),
                 )
             )
@@ -170,14 +202,16 @@ def build_examples(
         # ---- video:整段概括(与推理一致,不带图像) ----
         if seq.video_caption.strip():
             involved = tuple(sorted(traj.track_id for traj in trajectories))
-            pooled, transcript = pooled_for("video")
+            feats, texts, priors = fact_bundle("video")
             examples.append(
                 _Example(
                     task="video",
                     seq=seq,
-                    prompt_body=build_video_prompt(involved, transcript),
-                    pooled_facts=pooled,
                     target_text=seq.video_caption.strip(),
+                    prompt_ids=involved,
+                    fact_feats=feats,
+                    fact_texts=texts,
+                    fact_priorities=priors,
                 )
             )
     return examples
@@ -226,40 +260,93 @@ class _FrameRenderer:
 _MISSING = object()
 
 
+@dataclass
+class _Modules:
+    """四个可学习槽位打包传递(训练循环内部用)。"""
+
+    unary_kfa: LearnableUnaryKFA
+    pairwise_kfa: LearnablePairwiseKFA
+    fact_selector: LearnableFactSelector
+    projector: MLPProjector
+
+    def all(self) -> tuple:
+        return (self.unary_kfa, self.pairwise_kfa, self.fact_selector, self.projector)
+
+
 def example_loss(
     model,
     processor,
-    kfa: LearnableUnaryKFA,
-    projector: MLPProjector,
+    modules: _Modules,
     example: _Example,
     renderer: _FrameRenderer,
     top_k_frames: int,
+    top_k_pair_frames: int,
+    fact_top_k: int,
     device: str,
 ):
-    """一条样本的完整前向:KFA(仅 instance)-> projector -> 渲染证据帧 ->
-    共享的 teacher_forced_loss。返回可反传的 loss。"""
+    """一条样本的完整前向:fact selector(全任务)-> 任务对应 KFA ->
+    [fact | unary | pairwise] 槽位组装 -> projector -> 渲染证据帧 ->
+    共享的 teacher_forced_loss。返回可反传的 loss。
+
+    可学习模块全部走 forward()(不是 select()):训练需要 soft 向量留在
+    计算图里,select() 内部的 no_grad 会切断梯度,只适合推理。
+    """
     traj_by_id = {traj.track_id: traj for traj in example.seq.trajectories}
-    pooled4 = torch.tensor(example.pooled_facts, dtype=torch.float32, device=device)  # 4 维事实池化
+
+    # ---- fact 槽位:soft 读出(可导)+ hard top-k 渲染 transcript ----
+    if example.fact_feats:
+        fact_tensor = torch.tensor(
+            example.fact_feats, dtype=torch.float32, device=device
+        )
+        hard_facts, soft_facts = modules.fact_selector(fact_tensor, top_k=fact_top_k)
+        chosen = order_selected(hard_facts.tolist(), example.fact_priorities)
+        transcript = "; ".join(example.fact_texts[i] for i in chosen)
+    else:
+        # scope 内没有任何事实:fact 槽位补零(信息源缺席),transcript 为空。
+        soft_facts = torch.zeros(
+            modules.fact_selector.out_dim, dtype=torch.float32, device=device
+        )
+        transcript = ""
+
+    zeros_unary = torch.zeros(
+        modules.unary_kfa.out_dim, dtype=torch.float32, device=device
+    )
+    zeros_pair = torch.zeros(
+        modules.pairwise_kfa.out_dim, dtype=torch.float32, device=device
+    )
 
     if example.task == "instance":
+        prompt_body = build_instance_prompt(example.prompt_ids[0], transcript)
         features = torch.tensor(example.features, dtype=torch.float32, device=device)
-        # KFA 走 forward()(不是 select()):训练需要 soft_vector 留在计算图里,
-        # select() 内部的 no_grad 会切断梯度,只适合推理。
-        hard_indices, soft_vector = kfa(features, top_k=top_k_frames)
+        hard_frames, soft_unary = modules.unary_kfa(features, top_k=top_k_frames)
         traj = traj_by_id[example.track_id]
-        frame_ts = tuple(sorted(traj.per_frame[i].t for i in hard_indices.tolist()))
+        frame_ts = tuple(sorted(traj.per_frame[i].t for i in hard_frames.tolist()))
         box_track_ids = (example.track_id,)
-        pooled = torch.cat([pooled4, soft_vector])  # 4 维事实 + KFA soft 向量拼接
-    else:
-        # 无 unary soft 向量的任务:KFA 分量按零补齐(与推理侧
-        # projector.project 的缺失语义一致),KFA 不参与本条样本的梯度。
-        frame_ts = example.static_frame_ts
+        pooled = torch.cat([soft_facts, soft_unary, zeros_pair])
+    elif example.task == "interaction":
+        prompt_body = build_interaction_prompt(*example.prompt_ids, transcript)
+        if example.pair_feats:
+            pair_tensor = torch.tensor(
+                example.pair_feats, dtype=torch.float32, device=device
+            )
+            hard_frames, soft_pair = modules.pairwise_kfa(
+                pair_tensor, top_k=top_k_pair_frames
+            )
+            frame_ts = tuple(sorted(example.pair_ts[i] for i in hard_frames.tolist()))
+        else:
+            # 双方无共同观测帧(退化数据):纯文本样本 + pairwise 槽位补零,
+            # 与 LearnablePairwiseKFA.select 对空 pair_features 的语义一致。
+            soft_pair = zeros_pair
+            frame_ts = ()
         box_track_ids = example.box_track_ids
-        pooled = torch.cat(
-            [pooled4, torch.zeros(kfa.out_dim, dtype=torch.float32, device=device)]
-        )
+        pooled = torch.cat([soft_facts, zeros_unary, soft_pair])
+    else:  # video:没有任何 KFA 分量,两个槽位都补零
+        prompt_body = build_video_prompt(example.prompt_ids, transcript)
+        frame_ts = ()
+        box_track_ids = ()
+        pooled = torch.cat([soft_facts, zeros_unary, zeros_pair])
 
-    soft_tokens = projector(pooled).squeeze(0)  # (n_tokens, d_llm)
+    soft_tokens = modules.projector(pooled).squeeze(0)  # (n_tokens, d_llm)
 
     # 逐证据帧收集 box_track_ids 里每个 track 在该帧的框(缺观测则跳过),
     # 与 Pipeline._frame_boxes 的形状约定完全一致,供画框/推理侧复用同一份 compose_prompt_text。
@@ -280,7 +367,7 @@ def example_loss(
     # 与推理侧 QwenMLLMAdapter 完全同构的 prompt 组装(同一个 compose_prompt_text),
     # 这是"训练看到的输入分布 == 推理看到的输入分布"的关键保证。
     text = compose_prompt_text(
-        example.task, example.prompt_body, frame_boxes, has_images=bool(images)
+        example.task, prompt_body, frame_boxes, has_images=bool(images)
     )
     content = [{"type": "image", "image": img} for img in images]
     content.append({"type": "text", "text": text})
@@ -318,27 +405,36 @@ def train(args) -> dict:
     if args.grad_checkpoint:
         # 用计算换显存:反向传播时重算前向激活值而不是全部缓存,
         # use_reentrant=False 是 PyTorch 推荐的新实现(兼容性更好)。
-        # 8GB 显卡跑 2B 多模态模型的训练前向,不开这个大概率 OOM。
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
     embedding = model.get_input_embeddings()
     embed_rms = float(embedding.weight.detach().float().pow(2).mean().sqrt())
 
-    kfa = LearnableUnaryKFA().to(device)
+    unary_kfa = LearnableUnaryKFA().to(device)
+    pairwise_kfa = LearnablePairwiseKFA().to(device)
+    fact_selector = LearnableFactSelector().to(device)
     projector = MLPProjector(
-        in_dim=len(examples[0].pooled_facts) + kfa.out_dim,  # 4 维事实 + KFA soft 向量维度
+        # [fact | unary | pairwise] 槽位布局(与 Pipeline._compose_pooled
+        # 的推理侧组装同一契约,tests/test_ml_modules.py 锁住两侧一致)。
+        in_dim=fact_selector.out_dim + unary_kfa.out_dim + pairwise_kfa.out_dim,
         d_llm=embedding.embedding_dim,
         n_tokens=args.n_tokens,
         output_gain=embed_rms,  # 见 MLPProjector 模块 docstring:对齐冻结 LM 词嵌入尺度
     ).to(device)
-    kfa.train()
-    projector.train()
-    trainable = list(itertools.chain(kfa.parameters(), projector.parameters()))
-    optimizer = torch.optim.AdamW(trainable, lr=args.lr)  # 只优化这两个模块,冻结 MLLM 不在内
+    modules = _Modules(unary_kfa, pairwise_kfa, fact_selector, projector)
+    for module in modules.all():
+        module.train()
+    trainable = list(
+        itertools.chain.from_iterable(m.parameters() for m in modules.all())
+    )
+    optimizer = torch.optim.AdamW(trainable, lr=args.lr)  # 只优化四个槽位,冻结 MLLM 不在内
     n_trainable = sum(p.numel() for p in trainable)
-    print(f"[模型] 可训练参数 {n_trainable/1e3:.1f}K,d_llm={embedding.embedding_dim},"
-          f" embed_rms={embed_rms:.4f}", file=sys.stderr)
+    print(
+        f"[模型] 可训练参数 {n_trainable/1e3:.1f}K,d_llm={embedding.embedding_dim},"
+        f" embed_rms={embed_rms:.4f},projector in_dim={modules.projector.in_dim}",
+        file=sys.stderr,
+    )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -349,19 +445,29 @@ def train(args) -> dict:
     epoch_means: list[float] = []
     empty_cache_every = 20  # 周期清空 CUDA 缓存分配器,缓解变长样本的碎片化
 
-    def save(epoch: int) -> None:
-        save_stage1a_checkpoint(
-            out_dir / "stage1a.pt",
-            kfa,
-            projector,
-            extra={
-                "fact_stats": fact_stats,
-                "epochs": epoch,
-                "steps": step,
-                "epoch_mean_losses": epoch_means,
-                "model_id": args.model_id,
-            },
-        )
+    def save(epoch: int, stamp: bool = False) -> None:
+        extra = {
+            "fact_stats": fact_stats,
+            "epochs": epoch,
+            "steps": step,
+            "epoch_mean_losses": epoch_means,
+            "model_id": args.model_id,
+        }
+        # 周期性存档一律覆盖 stage1b.pt;epoch 末尾(stamp=True)额外留
+        # 一份带 epoch 戳的副本——不同训练预算(1 epoch vs 2 epochs)的
+        # checkpoint 都能拿去评测对比,不会被后续 epoch 覆盖。
+        targets = [out_dir / "stage1b.pt"]
+        if stamp:
+            targets.append(out_dir / f"stage1b_epoch{epoch}.pt")
+        for target in targets:
+            save_stage1b_checkpoint(
+                target,
+                modules.unary_kfa,
+                modules.pairwise_kfa,
+                modules.fact_selector,
+                modules.projector,
+                extra=extra,
+            )
 
     # buffering=1(行缓冲):每条 loss 记录立刻落盘,外部监控/断点续查
     # 才能看到真实进度(块缓冲曾让日志停在 flush 点,掩盖了停摆位置)。
@@ -373,10 +479,11 @@ def train(args) -> dict:
             for index in order:
                 example = examples[index]
                 loss = example_loss(
-                    model, processor, kfa, projector, example,
-                    renderer, args.top_k_frames, device,
+                    model, processor, modules, example, renderer,
+                    args.top_k_frames, args.top_k_pair_frames, args.fact_top_k,
+                    device,
                 )
-                loss.backward()  # 单样本一步(无 batch 维度累积),梯度只流向 kfa/projector
+                loss.backward()  # 单样本一步(无 batch 维度累积),梯度只流向四个槽位
                 torch.nn.utils.clip_grad_norm_(trainable, args.clip_norm)  # 防止个别样本梯度爆炸
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)  # set_to_none 比清零张量更省一次写显存
@@ -412,10 +519,10 @@ def train(args) -> dict:
             epoch_means.append(mean_loss)
             print(f"[epoch {epoch}] mean loss = {mean_loss:.4f}",
                   file=sys.stderr, flush=True)
-            save(epoch)
+            save(epoch, stamp=True)
 
     print(
-        f"[完成] checkpoint -> {out_dir / 'stage1a.pt'};"
+        f"[完成] checkpoint -> {out_dir / 'stage1b.pt'};"
         f" loss 曲线 -> {log_path}",
         file=sys.stderr,
     )
@@ -424,10 +531,10 @@ def train(args) -> dict:
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="python -m smot.ml.training", description="Stage-1a 训练循环"
+        prog="python -m smot.ml.training", description="Stage-1b 训练循环"
     )
     parser.add_argument("root", help="BenSMOT 根目录(或任意包含序列的子目录)")
-    parser.add_argument("--out-dir", default="out/stage1a")
+    parser.add_argument("--out-dir", default="out/stage1b")
     parser.add_argument("--limit", type=int, default=None, help="最多加载的序列数")
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -436,6 +543,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--top-k-frames", type=int, default=2,
         help="instance 任务每步送入 MLLM 的关键帧数(训练时从紧,控显存)",
+    )
+    parser.add_argument(
+        "--top-k-pair-frames", type=int, default=2,
+        help="interaction 任务每步送入 MLLM 的关键帧数(pairwise KFA hard 选帧)",
+    )
+    parser.add_argument(
+        "--fact-top-k", type=int, default=6,
+        help="fact selector 每步选进 transcript 的事实条数",
     )
     parser.add_argument("--image-max-side", type=int, default=640)
     parser.add_argument("--log-every", type=int, default=10)

@@ -1,17 +1,20 @@
-"""Stage-1a 验收门禁 #1(§6/§10):梯度恰好且仅落在可训练槽位上。
+"""验收门禁 #1(§6/§10):梯度恰好且仅落在可训练槽位上(Stage-1b 四模块)。
 
-流程:dummy batch(随机轨迹特征 + 随机事实池化向量 + 合成图像 + 教师
-强制目标句)-> 完整前向(KFA soft 读出 -> projector -> soft token 经
-embedding hook 注入冻结 Qwen3.5 -> CE loss)-> backward,然后断言:
+流程:两条 dummy 样本走与训练循环完全同一条前向路径——
+  instance    fact selector soft + unary KFA soft -> [fact | unary | 0]
+  interaction fact selector soft + pairwise KFA soft -> [fact | 0 | pairwise]
+各自经 projector -> soft token 经 embedding hook 注入冻结 Qwen3.5 ->
+CE loss;两条 loss 相加 backward,然后断言:
 
-  1. LearnableUnaryKFA 与 MLPProjector 的每个参数都拿到了梯度张量,
-     且两个模块的总梯度范数 > 0(训练信号真实到达);
+  1. {unary KFA, pairwise KFA, fact selector, projector} 的每个参数都
+     拿到了梯度张量,且每个模块的总梯度范数 > 0(训练信号真实到达
+     全部四个槽位);
   2. 冻结 MLLM(含视觉塔)的所有参数 requires_grad=False 且 .grad 为
      None(一个都不许漏);
   3. 模型处于 eval() 模式,loss 有限。
 
-不满足任何一条即 FAIL——这是 M-B1 的完成判据,训练循环(M-B2)只允许
-在本门禁通过之后开工。用法:
+不满足任何一条即 FAIL——Stage-1b 训练只允许在本门禁通过之后开工
+(与 M-B1 对 Stage-1a 的判据一致)。用法:
 
     python -m smot.ml.gradient_check [--model-id Qwen/Qwen3.5-2B]
                                      [--device cuda] [--quantize-4bit]
@@ -26,6 +29,8 @@ import torch
 from PIL import Image, ImageDraw
 
 from smot.frame_features import FRAME_FEATURE_DIM
+from smot.ml.fact_selector import FACT_SCORE_DIM, LearnableFactSelector
+from smot.ml.pairwise_kfa import LearnablePairwiseKFA
 from smot.ml.projector import MLPProjector
 from smot.ml.qwen_adapter import (
     DEFAULT_MODEL_ID,
@@ -33,12 +38,18 @@ from smot.ml.qwen_adapter import (
     teacher_forced_loss,
 )
 from smot.ml.unary_kfa import LearnableUnaryKFA
+from smot.pair_features import PAIR_FEATURE_DIM
 
-# dummy batch 的教师强制目标句(内容不重要,只要能算出一个 CE loss)。
-_TARGET_TEXT = "track_id=1 walks to the right and then stops."
-_PROMPT_TEXT = (
+# dummy 样本的教师强制目标句(内容不重要,只要能算出 CE loss)。
+_INSTANCE_TARGET = "track_id=1 walks to the right and then stops."
+_INSTANCE_PROMPT = (
     "Describe the behavior of track_id=1 based on the following motion "
     "facts: presence 1~8; mean speed 5.0 px/frame."
+)
+_INTERACTION_TARGET = '[{"subject_id": 1, "object_id": 2, "predicate": "talk"}]'
+_INTERACTION_PROMPT = (
+    "Describe the interaction between subject_id=1 and object_id=2 based on "
+    "the following motion facts: proximity 12.0 px; approach closer."
 )
 
 
@@ -67,32 +78,69 @@ def run_gradient_check(
     # 的模块 docstring)。
     embed_rms = float(embedding.weight.detach().float().pow(2).mean().sqrt())
 
-    kfa = LearnableUnaryKFA().to(device)
+    unary_kfa = LearnableUnaryKFA().to(device)
+    pairwise_kfa = LearnablePairwiseKFA().to(device)
+    fact_selector = LearnableFactSelector().to(device)
     projector = MLPProjector(
-        in_dim=4 + kfa.out_dim, d_llm=d_llm, output_gain=embed_rms
+        # 与训练循环同一份 [fact | unary | pairwise] 槽位布局。
+        in_dim=fact_selector.out_dim + unary_kfa.out_dim + pairwise_kfa.out_dim,
+        d_llm=d_llm,
+        output_gain=embed_rms,
     ).to(device)
-    kfa.train()
-    projector.train()
+    trainable_modules = {
+        "unary_kfa": unary_kfa,
+        "pairwise_kfa": pairwise_kfa,
+        "fact_selector": fact_selector,
+        "projector": projector,
+    }
+    for module in trainable_modules.values():
+        module.train()
 
-    # ---- dummy batch 前向:特征 -> KFA -> projector -> soft token ----
-    features = torch.rand(n_frames, FRAME_FEATURE_DIM, device=device)
-    fact_vector = torch.rand(4, device=device)
-    _hard_indices, soft_vector = kfa(features, top_k=top_k)
-    pooled = torch.cat([fact_vector, soft_vector])
-    soft_tokens = projector(pooled).squeeze(0)  # (n_tokens, d_llm)
+    zeros_unary = torch.zeros(unary_kfa.out_dim, device=device)
+    zeros_pair = torch.zeros(pairwise_kfa.out_dim, device=device)
 
-    # ---- 组多模态 prompt + 教师强制目标:与训练循环共用同一条组装
-    # 路径(teacher_forced_loss),门禁校验过的就是训练真正跑的。 ----
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": _synthetic_image()},
-                {"type": "text", "text": _PROMPT_TEXT},
-            ],
-        }
-    ]
-    loss = teacher_forced_loss(model, processor, messages, soft_tokens, _TARGET_TEXT)
+    def message_for(prompt: str):
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": _synthetic_image()},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+
+    # ---- instance 样本:fact selector + unary KFA 两条 soft 通路 ----
+    fact_feats = torch.rand(5, FACT_SCORE_DIM, device=device)
+    _hard_f, soft_facts = fact_selector(fact_feats, top_k=3)
+    unary_feats = torch.rand(n_frames, FRAME_FEATURE_DIM, device=device)
+    _hard_u, soft_unary = unary_kfa(unary_feats, top_k=top_k)
+    inst_tokens = projector(
+        torch.cat([soft_facts, soft_unary, zeros_pair])
+    ).squeeze(0)
+    loss_instance = teacher_forced_loss(
+        model, processor, message_for(_INSTANCE_PROMPT), inst_tokens, _INSTANCE_TARGET
+    )
+
+    # ---- interaction 样本:fact selector + pairwise KFA 两条 soft 通路 ----
+    fact_feats2 = torch.rand(4, FACT_SCORE_DIM, device=device)
+    _hard_f2, soft_facts2 = fact_selector(fact_feats2, top_k=3)
+    pair_feats = torch.rand(6, PAIR_FEATURE_DIM, device=device)
+    _hard_p, soft_pair = pairwise_kfa(pair_feats, top_k=2)
+    inter_tokens = projector(
+        torch.cat([soft_facts2, zeros_unary, soft_pair])
+    ).squeeze(0)
+    loss_interaction = teacher_forced_loss(
+        model,
+        processor,
+        message_for(_INTERACTION_PROMPT),
+        inter_tokens,
+        _INTERACTION_TARGET,
+    )
+
+    # 两条样本相加一起 backward:一次反传覆盖全部四个槽位的通路
+    # (unary 只在 instance 通路上、pairwise 只在 interaction 通路上)。
+    loss = loss_instance + loss_interaction
     loss.backward()
 
     # ---- 断言收集 ----
@@ -104,10 +152,10 @@ def run_gradient_check(
     if not torch.isfinite(loss):
         failures.append(f"loss 非有限值: {loss.item()!r}")
 
-    # 逐参数检查:两个可训练模块的每一个参数张量都必须 requires_grad=True
+    # 逐参数检查:四个可训练模块的每一个参数张量都必须 requires_grad=True
     # 且拿到非 None、有限、非全零的梯度——任何一项不满足都记一条失败。
     trainable_norms: dict[str, float] = {}
-    for module_name, module in (("unary_kfa", kfa), ("projector", projector)):
+    for module_name, module in trainable_modules.items():
         total = 0.0
         for name, param in module.named_parameters():
             if not param.requires_grad:
@@ -150,7 +198,8 @@ def run_gradient_check(
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="python -m smot.ml.gradient_check", description="Stage-1a 梯度门禁"
+        prog="python -m smot.ml.gradient_check",
+        description="Stage-1b 梯度门禁(四可训练槽位)",
     )
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--device", default="cuda")

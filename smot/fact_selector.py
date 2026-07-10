@@ -53,12 +53,21 @@ class FactSelector(Protocol):
         ...
 
 
-def _render_fact(fact: Fact) -> str:
+def render_fact(fact: Fact) -> str:
     """把一条 Fact 渲染成一小段人类可读的文本,格式大致是
     "<类型>[<范围>]=<值> (t=<起>..<止>)",作为最终塞进 MLLM prompt 里的
-    transcript 片段。
+    transcript 片段。确定性与可学习 Fact Selector 共用同一份渲染——
+    学习改变的只是"选哪些",不是"长什么样"(否则 prompt 分布漂移)。
     """
     return f"{fact.type.value}[{fact.scope}]={fact.value} (t={fact.t_span[0]}..{fact.t_span[1]})"
+
+
+def scoped_facts(facts: list[Fact], scope: str) -> list[Fact]:
+    """按 SelectionContext.scope 过滤事实。"video" 是通配 scope:对全部
+    事实池做概括,不按 scope 过滤(两个 selector 实现共用这条约定)。"""
+    if scope == "video":
+        return list(facts)
+    return [f for f in facts if f.scope == scope]
 
 
 class DeterministicFactSelector:
@@ -70,12 +79,7 @@ class DeterministicFactSelector:
         self.priority_order = priority_order
 
     def select(self, facts: list[Fact], query_context: SelectionContext) -> FactSelection:
-        if query_context.scope == "video":
-            # 视频级别的查询是对"全部事实池"做概括,而不是某一个具体的
-            # instance/pair scope,所以这里用全集而不是按 scope 过滤。
-            scoped = list(facts)
-        else:
-            scoped = [f for f in facts if f.scope == query_context.scope]
+        scoped = scoped_facts(facts, query_context.scope)
 
         def sort_key(fact: Fact) -> int:
             try:
@@ -87,5 +91,5 @@ class DeterministicFactSelector:
 
         ordered = sorted(scoped, key=sort_key)
         selected = tuple(ordered[: query_context.top_k])
-        text = "; ".join(_render_fact(f) for f in selected)
+        text = "; ".join(render_fact(f) for f in selected)
         return FactSelection(selected_facts=selected, soft_token=None, text=text)

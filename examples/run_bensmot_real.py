@@ -1,16 +1,17 @@
-"""BenSMOT + 真实冻结 Qwen3.5 的端到端推理脚本(M-A2/M-B2 共用)。
+"""BenSMOT + 真实冻结 Qwen3.5 的端到端推理脚本(M-A2/M-B2/M-B3 共用)。
 
 与 run_bensmot_stage0.py 的唯一区别:MLLM 从 Mock 换成真实的
 QwenMLLMAdapter(关键帧图像 + 画框 grounding + 结构化 JSON 输出),
-可选地再注入训练好的 Stage-1a 组件(--checkpoint)。产出与 stage0
-脚本同构(pred/gold/metrics 三个 JSON),两组结果可以直接对比——
-这就是"真实 MLLM 相对 Mock 地板的提升"与"学习后相对确定性选择的
-提升"两条对照的载体。
+可选地再注入训练好的可学习组件(--checkpoint,1a/1b 格式自动判别:
+1a 注入 unary KFA + projector,1b 额外注入 pairwise KFA + fact
+selector + pair 特征向量化接缝)。产出与 stage0 脚本同构(pred/gold/
+metrics 三个 JSON),各组结果可以直接对比——这就是"真实 MLLM 相对
+Mock 地板的提升"与"学习后相对确定性选择的提升"两条对照的载体。
 
 用法:
     python examples/run_bensmot_real.py <BenSMOT根目录或子目录> \
         [--limit N] [--out-dir out/bensmot_real] [--model-id Qwen/Qwen3.5-2B] \
-        [--quantize-4bit] [--checkpoint stage1a.pt] [--skip-errors]
+        [--quantize-4bit] [--checkpoint stage1b.pt] [--skip-errors]
 
 需要 ml 依赖(venv + torch cu128 + transformers,见 README)。
 """
@@ -32,6 +33,7 @@ from smot.datasets.bensmot import (
 from smot.eval import evaluate
 from smot.event_filter import EventCandidateFilter, adaptive_proximity_gate
 from smot.frame_features import geometric_frame_features
+from smot.pair_features import pair_feature_vectors
 from smot.pipeline import Pipeline
 from smot.tracker import StubTracker
 
@@ -47,7 +49,7 @@ def main() -> int:
     parser.add_argument(
         "--checkpoint",
         default=None,
-        help="Stage-1a checkpoint(注入训练好的 unary KFA + projector)",
+        help="训练好的 checkpoint(1a/1b 格式自动判别,注入对应可学习组件)",
     )
     parser.add_argument("--skip-errors", action="store_true")
     args = parser.parse_args()
@@ -70,19 +72,20 @@ def main() -> int:
         quantize_4bit=args.quantize_4bit,
     )
 
-    kfa = projector = fact_transform = None
+    loaded = fact_transform = None
     if args.checkpoint:
         from smot.fact_norm import make_fact_embed_normalizer
-        from smot.ml.checkpoint import load_stage1a_checkpoint
+        from smot.ml.checkpoint import load_checkpoint
 
-        kfa, projector, extra = load_stage1a_checkpoint(args.checkpoint, device="cuda")
+        loaded = load_checkpoint(args.checkpoint, device="cuda")
         # 训练时的 fact 统计量随 checkpoint 保存,推理侧必须做同一份
-        # embed 归一化,否则 projector 收到的输入分布与训练时不一致。
-        if extra.get("fact_stats"):
-            fact_transform = make_fact_embed_normalizer(extra["fact_stats"])
+        # embed 归一化,否则可学习组件收到的输入分布与训练时不一致。
+        if loaded.extra.get("fact_stats"):
+            fact_transform = make_fact_embed_normalizer(loaded.extra["fact_stats"])
         print(
-            f"[checkpoint] 已加载 {args.checkpoint}: epochs={extra.get('epochs')},"
-            f" steps={extra.get('steps')}", file=sys.stderr,
+            f"[checkpoint] 已加载 {args.checkpoint}(stage={loaded.stage}): "
+            f"epochs={loaded.extra.get('epochs')},"
+            f" steps={loaded.extra.get('steps')}", file=sys.stderr,
         )
 
     preds: list[dict] = []
@@ -99,10 +102,10 @@ def main() -> int:
                 proximity_trigger=True,
             ),
         }
-        if kfa is not None:  # 只有传了 --checkpoint 才用可学习组件,否则维持 Stage-0 NoOp 默认值
+        if loaded is not None:  # 只有传了 --checkpoint 才用可学习组件,否则维持 Stage-0 NoOp 默认值
             pipeline_kwargs.update(
-                unary_kfa=kfa,
-                projector=projector,
+                unary_kfa=loaded.unary_kfa,
+                projector=loaded.projector,
                 # 逐帧特征的时间归一化用本序列的全局最大帧号。
                 # 用默认参数 _tm=t_max 把当前循环变量的值"冻结"进闭包——
                 # 直接引用外层 t_max 会有经典的 Python 闭包晚绑定问题
@@ -112,6 +115,17 @@ def main() -> int:
                 ),
                 fact_transform=fact_transform,
             )
+            if loaded.pairwise_kfa is not None:
+                # Stage-1b 组件:可学习 pairwise KFA + fact selector,以及
+                # pairwise 打分需要的向量化特征接缝(时间归一化同样按本
+                # 序列的 t_max 冻结进闭包,与训练侧 build_examples 一致)。
+                pipeline_kwargs.update(
+                    pairwise_kfa=loaded.pairwise_kfa,
+                    fact_selector=loaded.fact_selector,
+                    pair_feature_fn=lambda pfs, _tm=t_max: pair_feature_vectors(
+                        pfs, t_max=_tm
+                    ),
+                )
         pipeline = Pipeline(**pipeline_kwargs)
         result = pipeline.run(sequence_to_video_handle(seq))
         payload = result.to_json_dict()

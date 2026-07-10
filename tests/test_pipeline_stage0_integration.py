@@ -39,9 +39,9 @@ class _RecordingPairwiseKFA(NoOpPairwiseKFA):
     def __init__(self):
         self.received_pair_features = []
 
-    def select(self, edge, event_candidate, top_k, pair_features=()):
+    def select(self, edge, event_candidate, top_k, pair_features=(), features=None):
         self.received_pair_features.append(tuple(pair_features))
-        return super().select(edge, event_candidate, top_k, pair_features)
+        return super().select(edge, event_candidate, top_k, pair_features, features)
 
 
 class TestPipelineStage0Integration(unittest.TestCase):

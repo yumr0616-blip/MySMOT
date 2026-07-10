@@ -13,6 +13,19 @@ projector 的输出原样塞进 MLLMRequest.soft_tokens。Stage-0 的
 NoOpProjector 返回空 tuple,所以行为上没有变化;但任何返回非空
 token 的真实 projector 接进来,token 立刻会到达 MLLM 适配器,
 不需要再改 Pipeline 的任何布线。
+
+projector 输入的槽位布局(Stage-1b 起,见 _compose_pooled):
+    [ fact 分量 | unary KFA soft | pairwise KFA soft ]
+fact 分量优先用 Fact Selector 的 soft 读出(可学习实现),确定性
+实现(soft_token=None)退回事实 embed 均值池化;三个槽位中"本次
+调用不产出"的分量按零占位(零 = 该信息源缺席):中间槽位由
+Pipeline 显式补零,尾部槽位由 projector.project 的补零语义兜底。
+各调用点的实际布局:
+    instance     [fact | unary | 0]
+    interaction  [fact | 0     | pairwise]
+    video        [fact | 0     | 0]
+Stage-0/1a 组件不产出对应分量时槽位整体消失(而不是补零),因此
+旧配置的池化向量与升级前逐字节一致——升级不惊扰已有 checkpoint。
 """
 from __future__ import annotations
 
@@ -29,7 +42,14 @@ from smot.pair_features import build_pair_features
 from smot.projector import NoOpProjector, Projector
 from smot.prompts import build_instance_prompt, build_interaction_prompt, build_video_prompt
 from smot.tracker import Tracker, VideoHandle
-from smot.types import Fact, InstanceAssertion, InteractionAssertion, Trajectory, VideoAssertion
+from smot.types import (
+    Fact,
+    InstanceAssertion,
+    InteractionAssertion,
+    PairFeature,
+    Trajectory,
+    VideoAssertion,
+)
 
 
 @dataclass
@@ -130,6 +150,9 @@ class Pipeline:
             Callable[[Trajectory], Sequence[tuple[float, ...]]]
         ] = None,
         fact_transform: Optional[Callable[[list[Fact]], list[Fact]]] = None,
+        pair_feature_fn: Optional[
+            Callable[[Sequence[PairFeature]], Sequence[tuple[float, ...]]]
+        ] = None,
     ):
         # tracker 没有默认值——它必须由调用方显式提供(Stage-0 下通常是
         # StubTracker 注入的 GT/预置轨迹;真正跑真实 tracker 时替换成
@@ -143,6 +166,11 @@ class Pipeline:
         # (Stage-1a 用它注入 embed 归一化,见 smot.fact_norm;训练与
         # 推理必须注入同一份变换)。默认 None 保持原始 embed。
         self.fact_transform = fact_transform
+        # pair_feature_fn:可学习 Pairwise KFA 的向量化特征来源(Stage-1b
+        # 注入,例如 smot.pair_features.pair_feature_vectors 的偏函数,
+        # t_max 由调用方按序列冻结)。默认 None,此时 pairwise KFA 的
+        # features 参数收到 None,保持 Stage-0 行为。
+        self.pair_feature_fn = pair_feature_fn
         self.motion_fact_extractor = motion_fact_extractor or MotionFactExtractor()
         self.event_filter = event_filter or EventCandidateFilter()
         self.fact_selector = fact_selector or DeterministicFactSelector()
@@ -199,6 +227,40 @@ class Pipeline:
             cost=cost,
         )
 
+    def _compose_pooled(
+        self,
+        fact_selection,
+        unary_soft: Optional[tuple[float, ...]] = None,
+        pairwise_soft: Optional[tuple[float, ...]] = None,
+    ) -> tuple[float, ...]:
+        """按 [fact | unary | pairwise] 槽位布局组装 projector 输入
+        (布局约定见模块 docstring)。
+
+        fact 分量:可学习 Fact Selector 的 soft 读出优先;确定性实现
+        (soft_token=None)退回事实 embed 均值池化——Stage-0/1a 行为
+        不变。中间槽位(unary)只在"后面还有分量要落位"且 unary KFA
+        是会产出 soft 向量的实现(暴露 out_dim)时才需要显式补零,
+        尾部缺失分量交给 projector.project 的补零语义,两者的"零 =
+        信息源缺席"含义一致。
+        """
+        fact_component = (
+            fact_selection.soft_token
+            if fact_selection.soft_token is not None
+            else _pool_embeds(fact_selection.selected_facts)
+        )
+        parts = list(fact_component)
+        if unary_soft is not None:
+            parts.extend(unary_soft)
+        elif pairwise_soft is not None:
+            # unary 槽位缺席但 pairwise 分量在后:补零占住 unary 槽位,
+            # 否则 pairwise 向量会错位落进 unary 的输入维度。宽度取自
+            # 可学习 unary KFA 的 out_dim;NoOp 实现没有这个属性(它
+            # 从不产出 soft 向量,布局里也就没有它的槽位),补零宽度 0。
+            parts.extend([0.0] * (getattr(self.unary_kfa, "out_dim", 0) or 0))
+        if pairwise_soft is not None:
+            parts.extend(pairwise_soft)
+        return tuple(parts)
+
     def _generate(self, request: MLLMRequest, cost: CostReport) -> str:
         """所有 MLLM 调用的唯一出口:顺手把成本计数记全,保证任何新增
         的调用路径都不会漏计。
@@ -228,15 +290,14 @@ class Pipeline:
             self.config.top_k_instance_frames,
             features=features,
         )
-        pooled = _pool_embeds(selection.selected_facts)
-        if kfa_selection.soft_token is not None:
-            # KFA 的 soft 读出向量拼接在事实池化向量之后一起进 projector。
-            # 这是"hard top-k 搭 soft 读出梯度便车"的落地布线:被选中的
-            # 帧走图像通路(离散、无梯度),soft 向量走 projector->soft
-            # token 通路(可导)——两者共享同一组打分,训练信号经 soft
-            # 通路回传给 KFA 打分器。NoOp KFA 返回 None,布线自然短路。
-            pooled = tuple(pooled) + tuple(kfa_selection.soft_token)
-        soft_tokens = self.projector.project(pooled)
+        # KFA 的 soft 读出向量占住槽位布局的 unary 槽一起进 projector。
+        # 这是"hard top-k 搭 soft 读出梯度便车"的落地布线:被选中的
+        # 帧走图像通路(离散、无梯度),soft 向量走 projector->soft
+        # token 通路(可导)——两者共享同一组打分,训练信号经 soft
+        # 通路回传给 KFA 打分器。NoOp KFA 返回 None,槽位自然消失。
+        soft_tokens = self.projector.project(
+            self._compose_pooled(selection, unary_soft=kfa_selection.soft_token)
+        )
         prompt_text = build_instance_prompt(traj.track_id, selection.text)
         request = MLLMRequest(
             prompt_type="instance",
@@ -285,13 +346,21 @@ class Pipeline:
             candidate,
             self.config.top_k_pair_frames,
             pair_features=pair_features,
+            # 向量化特征由注入的 pair_feature_fn 提供(Stage-1b 的可学习
+            # pairwise KFA 用它打分);未注入时传 None,NoOp 也不使用。
+            features=(
+                self.pair_feature_fn(pair_features)
+                if self.pair_feature_fn is not None
+                else None
+            ),
         )
-        pooled = _pool_embeds(selection.selected_facts)
-        if kfa_selection.soft_token is not None:
-            # 与 _run_instance 相同的布线:pairwise KFA(Stage-1b 起可学习)
-            # 的 soft 读出向量拼进 projector 输入;NoOp 返回 None 时短路。
-            pooled = tuple(pooled) + tuple(kfa_selection.soft_token)
-        soft_tokens = self.projector.project(pooled)
+        # 与 _run_instance 相同的布线:pairwise KFA(Stage-1b 起可学习)
+        # 的 soft 读出向量占住 pairwise 槽位;NoOp 返回 None 时槽位消失。
+        # 本调用点没有 unary 分量,unary 槽位由 _compose_pooled 补零占住
+        # (仅当 unary KFA 是可学习实现时才存在这个槽位)。
+        soft_tokens = self.projector.project(
+            self._compose_pooled(selection, pairwise_soft=kfa_selection.soft_token)
+        )
         prompt_text = build_interaction_prompt(subject_id, object_id, selection.text)
         frames = kfa_selection.key_frames
         request = MLLMRequest(
@@ -324,7 +393,9 @@ class Pipeline:
             facts, SelectionContext(scope="video", top_k=self.config.fact_top_k)
         )
         cost.n_facts_selected += len(selection.selected_facts)
-        soft_tokens = self.projector.project(_pool_embeds(selection.selected_facts))
+        # video 调用点没有任何 KFA 分量:池化向量只有 fact 槽位,unary/
+        # pairwise 槽位留给 projector.project 尾部补零。
+        soft_tokens = self.projector.project(self._compose_pooled(selection))
         prompt_text = build_video_prompt(involved_ids, selection.text)
         request = MLLMRequest(
             prompt_type="video",

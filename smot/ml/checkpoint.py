@@ -1,16 +1,27 @@
-"""Stage-1a 可学习组件(unary KFA + projector)的 checkpoint 存取。
+"""可学习组件的 checkpoint 存取(Stage-1a 两模块 / Stage-1b 四模块)。
 
 训练(smot.ml.training)与推理(examples/run_bensmot_real.py --checkpoint)
 共用同一格式,构造参数一并存盘——加载侧不需要再记得训练时的维度配置,
 配置漂移(比如换了 n_tokens 之后加载旧档)会在 load_state_dict 的形状
 校验里当场暴露。
+
+两种格式:
+  Stage-1a  {kfa_*, projector_*}                       (历史格式,无 stage 键)
+  Stage-1b  {stage: "1b", unary_kfa_*, pairwise_kfa_*,
+             fact_selector_*, projector_*}
+load_checkpoint() 按 payload 自动判别,统一返回 LoadedCheckpoint;
+1a 专用函数保留,旧调用方/旧档案不受影响。
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import torch
 
+from smot.ml.fact_selector import LearnableFactSelector
+from smot.ml.pairwise_kfa import LearnablePairwiseKFA
 from smot.ml.projector import MLPProjector
 from smot.ml.unary_kfa import LearnableUnaryKFA
 
@@ -67,3 +78,77 @@ def load_stage1a_checkpoint(
     projector.load_state_dict(payload["projector_state"])
     projector.eval()
     return kfa, projector, payload.get("extra", {})
+
+
+def save_stage1b_checkpoint(
+    path: str | Path,
+    unary_kfa: LearnableUnaryKFA,
+    pairwise_kfa: LearnablePairwiseKFA,
+    fact_selector: LearnableFactSelector,
+    projector: MLPProjector,
+    extra: dict | None = None,
+) -> None:
+    """保存 Stage-1b 的四个可学习模块(权重 + 构造配置 + extra 元信息)。"""
+    payload = {
+        "stage": "1b",  # 格式判别字段(1a 历史格式没有它)
+        "unary_kfa_state": unary_kfa.state_dict(),
+        "unary_kfa_config": {"in_dim": unary_kfa.in_dim, "out_dim": unary_kfa.out_dim},
+        "pairwise_kfa_state": pairwise_kfa.state_dict(),
+        "pairwise_kfa_config": {
+            "in_dim": pairwise_kfa.in_dim,
+            "out_dim": pairwise_kfa.out_dim,
+        },
+        "fact_selector_state": fact_selector.state_dict(),
+        "fact_selector_config": {
+            "in_dim": fact_selector.in_dim,
+            "out_dim": fact_selector.out_dim,
+        },
+        "projector_state": projector.state_dict(),
+        "projector_config": {
+            "in_dim": projector.in_dim,
+            "d_llm": projector.d_llm,
+            "n_tokens": projector.n_tokens,
+        },
+        "extra": extra or {},
+    }
+    torch.save(payload, str(path))
+
+
+@dataclass
+class LoadedCheckpoint:
+    """load_checkpoint() 的统一返回:1a 档案的 1b 专属组件为 None。
+    调用方按"组件是否存在"接线 Pipeline,不需要自己分辨格式。"""
+
+    stage: str  # "1a" | "1b"
+    unary_kfa: LearnableUnaryKFA
+    projector: MLPProjector
+    pairwise_kfa: Optional[LearnablePairwiseKFA] = None
+    fact_selector: Optional[LearnableFactSelector] = None
+    extra: dict = field(default_factory=dict)
+
+
+def load_checkpoint(path: str | Path, device: str = "cpu") -> LoadedCheckpoint:
+    """通用加载器:按 payload 的 stage 键判别 1a/1b 格式,重建模块并加载
+    权重,全部置为 eval()。"""
+    payload = torch.load(str(path), map_location=device, weights_only=True)
+    if payload.get("stage") != "1b":
+        # 历史 Stage-1a 格式:直接复用专用加载器(键名不同)。
+        kfa, projector, extra = load_stage1a_checkpoint(path, device=device)
+        return LoadedCheckpoint(
+            stage="1a", unary_kfa=kfa, projector=projector, extra=extra
+        )
+
+    def build(cls, prefix: str):
+        module = cls(**payload[f"{prefix}_config"]).to(device)
+        module.load_state_dict(payload[f"{prefix}_state"])
+        module.eval()  # 推理模式;继续训练的话调用方自行 train()
+        return module
+
+    return LoadedCheckpoint(
+        stage="1b",
+        unary_kfa=build(LearnableUnaryKFA, "unary_kfa"),
+        pairwise_kfa=build(LearnablePairwiseKFA, "pairwise_kfa"),
+        fact_selector=build(LearnableFactSelector, "fact_selector"),
+        projector=build(MLPProjector, "projector"),
+        extra=payload.get("extra", {}),
+    )
