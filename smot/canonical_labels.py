@@ -10,11 +10,14 @@
 from __future__ import annotations
 
 CANONICAL_MAP: dict[str, str] = {
+    # 多种同义表达 -> "approach"(靠近)
     "approaches": "approach",
     "is approaching": "approach",
     "moves toward": "approach",
+    # 多种同义表达 -> "recede"(远离)
     "moves away from": "recede",
     "recedes from": "recede",
+    # 多种同义表达 -> "contact"(接触)
     "touches": "contact",
     "is in contact with": "contact",
     "follows": "follow",
@@ -30,5 +33,5 @@ def map_predicate(raw_predicate: str, canonical_map: dict[str, str] | None = Non
     不同粒度的映射表重跑同一批断言),不传则用模块级默认表。
     """
     table = CANONICAL_MAP if canonical_map is None else canonical_map
-    normalized = raw_predicate.strip().lower()
-    return table.get(normalized, normalized)
+    normalized = raw_predicate.strip().lower()  # 大小写/首尾空格差异不应影响匹配
+    return table.get(normalized, normalized)  # 查不到就用规范化后的原词兜底

@@ -18,9 +18,9 @@ from smot.types import Trajectory
 class EventCandidate:
     """一条候选交互边:哪两个 track_id、被哪些帧触发、触发原因是什么。"""
 
-    edge: tuple[int, int]
-    candidate_frames: tuple[int, ...]
-    triggers: tuple[str, ...]
+    edge: tuple[int, int]  # (track_id_i, track_id_j),i < j
+    candidate_frames: tuple[int, ...]  # 触发了任意规则的帧号,已排序去重
+    triggers: tuple[str, ...]  # 命中的触发规则名称(如 "contact"、"speed_change")
 
 
 def adaptive_proximity_gate(
@@ -58,9 +58,9 @@ class EventCandidateFilter:
         proximity_gate: float = 50.0,
         proximity_trigger: bool = False,
     ):
-        self.contact_iou_threshold = contact_iou_threshold
-        self.speed_change_ratio = speed_change_ratio
-        self.direction_change_deg = direction_change_deg
+        self.contact_iou_threshold = contact_iou_threshold  # IoU 达到此值算"接触"
+        self.speed_change_ratio = speed_change_ratio  # 相邻两段速度比值超过此值算"突变"
+        self.direction_change_deg = direction_change_deg  # 相邻两段方向夹角超过此值(度)算"突变"
         # 单目标层面的突变(速度/方向)只有在"这一对目标当时离得足够近"
         # 时才可能与这一对的交互有关。这个门控阈值(中心点距离,像素)
         # 用来避免 n 目标场景里一个目标的突变把它和其余 n-1 个目标的

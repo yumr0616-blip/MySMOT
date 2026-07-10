@@ -45,9 +45,12 @@ def _make_demo_trajectories() -> list[Trajectory]:
 
 
 def main() -> None:
+    """构造 -> 跑 Pipeline -> 打印结果,三步演示全流程最小闭环。"""
     trajectories = _make_demo_trajectories()
     # StubTracker 直接把提前造好的轨迹原样返回,相当于"假装"这是
     # 冻结 tracker 的输出结果。
+    # 构造 Pipeline 时不传其余任何组件参数——全部使用各自的 Stage-0
+    # 默认实现(NoOp KFA/Projector、DeterministicFactSelector、MockMLLMAdapter)。
     pipeline = Pipeline(tracker=StubTracker(trajectories))
     result = pipeline.run(VideoHandle(path="synthetic://two_object_demo", num_frames=5))
     print(json.dumps(result.to_json_dict(), indent=2))

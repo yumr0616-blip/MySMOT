@@ -104,6 +104,8 @@ def run_gradient_check(
     if not torch.isfinite(loss):
         failures.append(f"loss 非有限值: {loss.item()!r}")
 
+    # 逐参数检查:两个可训练模块的每一个参数张量都必须 requires_grad=True
+    # 且拿到非 None、有限、非全零的梯度——任何一项不满足都记一条失败。
     trainable_norms: dict[str, float] = {}
     for module_name, module in (("unary_kfa", kfa), ("projector", projector)):
         total = 0.0
@@ -118,11 +120,15 @@ def run_gradient_check(
             norm = float(param.grad.norm())
             total += norm
             if norm == 0.0:
+                # 单个参数梯度为零不一定是 bug(比如某些初始化下的正常现象),
+                # 只警告;整个模块总梯度为零才是真正的"信号没到达"。
                 warnings.append(f"{module_name}.{name} 梯度为全零")
         trainable_norms[module_name] = total
         if total == 0.0:
             failures.append(f"{module_name} 的总梯度范数为 0,训练信号未到达")
 
+    # 反向检查:冻结 MLLM 的每一个参数都不许 requires_grad,也不许有 .grad
+    # ——哪怕只漏检查一个参数,也可能是"意外没冻住"这类严重 bug。
     n_frozen = 0
     for name, param in model.named_parameters():
         n_frozen += 1

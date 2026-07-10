@@ -27,7 +27,9 @@ def color_for_track(track_id: int) -> str:
 
 @runtime_checkable
 class FrameProvider(Protocol):
-    def frame(self, t: int) -> Image.Image: ...
+    def frame(self, t: int) -> Image.Image:
+        """按帧号 t(1-based)取一帧图像。"""
+        ...
 
 
 class ImageDirFrameProvider:
@@ -47,16 +49,19 @@ class ImageDirFrameProvider:
         if not files:
             raise FileNotFoundError(f"{dir_path} 下没有图像文件")
         try:
+            # 文件名(去扩展名)全是数字 -> 直接拿数字当帧号(BenSMOT 的
+            # 000001.jpg 布局),这样帧号与 gt.txt 里的帧号天然一致。
             self._by_t = {int(p.stem): p for p in files}
         except ValueError:
+            # 有非数字文件名 -> 退回"排序后第 i 个文件当第 i 帧"(1-based)。
             self._by_t = {i: p for i, p in enumerate(files, 1)}
-        self._cache: OrderedDict[int, Image.Image] = OrderedDict()
+        self._cache: OrderedDict[int, Image.Image] = OrderedDict()  # LRU:有序字典模拟
         self._cache_size = cache_size
 
     def frame(self, t: int) -> Image.Image:
         cached = self._cache.get(t)
         if cached is not None:
-            self._cache.move_to_end(t)
+            self._cache.move_to_end(t)  # 标记为最近使用,推到淘汰队列末尾
             return cached
         path = self._by_t.get(t)
         if path is None:
@@ -64,10 +69,10 @@ class ImageDirFrameProvider:
             raise KeyError(
                 f"帧 {t} 不存在;可用帧号范围 {available[0]}~{available[-1]}"
             )
-        image = Image.open(path).convert("RGB")
+        image = Image.open(path).convert("RGB")  # 统一转 RGB,屏蔽调色板/灰度等格式差异
         self._cache[t] = image
         if len(self._cache) > self._cache_size:
-            self._cache.popitem(last=False)
+            self._cache.popitem(last=False)  # 淘汰最久未使用的一项(队首)
         return image
 
 
@@ -83,11 +88,11 @@ class VideoFileFrameProvider:
             raise FileNotFoundError(f"无法打开视频文件: {path}")
 
     def frame(self, t: int) -> Image.Image:
-        self._cap.set(self._cv2.CAP_PROP_POS_FRAMES, t - 1)
+        self._cap.set(self._cv2.CAP_PROP_POS_FRAMES, t - 1)  # t 是 1-based,cv2 是 0-based
         ok, bgr = self._cap.read()
         if not ok:
             raise KeyError(f"帧 {t} 超出视频范围")
-        rgb = self._cv2.cvtColor(bgr, self._cv2.COLOR_BGR2RGB)
+        rgb = self._cv2.cvtColor(bgr, self._cv2.COLOR_BGR2RGB)  # cv2 默认 BGR,PIL 需要 RGB
         return Image.fromarray(rgb)
 
 
@@ -110,10 +115,11 @@ def annotate_boxes(
     颜色图例("id=1 is the red box"),模型据此把 track_id 对应到画面
     里的具体的人。
     """
-    annotated = image.copy()
+    annotated = image.copy()  # 绝不原地改原图:同一帧对象可能被多个请求共享(见缓存)
     draw = ImageDraw.Draw(annotated)
-    for track_id, box in sorted(boxes.items()):
+    for track_id, box in sorted(boxes.items()):  # 排序保证多次调用画框顺序确定、可复现
         color = color_for_track(track_id)
         draw.rectangle(box, outline=color, width=3)
+        # 标签画在框左上角外侧;max(..., 0) 防止框贴着图像顶边时文字画出画布外。
         draw.text((box[0] + 3, max(box[1] - 14, 0)), f"id={track_id}", fill=color)
     return annotated

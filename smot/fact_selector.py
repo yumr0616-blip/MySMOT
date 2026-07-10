@@ -29,8 +29,8 @@ class SelectionContext:
                          对这个特殊值的通配处理)
     """
 
-    scope: str
-    top_k: int = 8
+    scope: str  # 查询范围,见上方约定
+    top_k: int = 8  # 最多选出的事实条数
 
 
 @dataclass(frozen=True)
@@ -39,14 +39,18 @@ class FactSelection:
     token、以及渲染成文本后的 transcript。
     """
 
-    selected_facts: tuple[Fact, ...]
-    soft_token: tuple[float, ...] | None
-    text: str
+    selected_facts: tuple[Fact, ...]  # 被选中、按优先级排序后的事实
+    soft_token: tuple[float, ...] | None  # 可学习实现的软读出向量;Stage-0 恒为 None
+    text: str  # 拼接好、可直接嵌入 prompt 的 transcript 文本
 
 
 @runtime_checkable
 class FactSelector(Protocol):
-    def select(self, facts: list[Fact], query_context: SelectionContext) -> FactSelection: ...
+    """所有 Fact Selector 实现(确定性或可学习)必须满足的接口。"""
+
+    def select(self, facts: list[Fact], query_context: SelectionContext) -> FactSelection:
+        """从 facts 中按 query_context 挑出一批事实并渲染成文本。"""
+        ...
 
 
 def _render_fact(fact: Fact) -> str:

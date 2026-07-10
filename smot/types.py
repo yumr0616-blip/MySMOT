@@ -49,10 +49,10 @@ class FramePresence:
     以及跟踪器给出的置信度。
     """
 
-    t: int
-    box: Box
+    t: int  # 帧号(从 0 开始,或数据集原生编号——与 Trajectory.present 同一套坐标)
+    box: Box  # (x1, y1, x2, y2) 像素坐标边界框
     mask: Optional[str] = None  # RLE 字符串;没有 mask 时为 None
-    conf: float = 1.0
+    conf: float = 1.0  # 跟踪器给出的置信度,[0, 1]
 
 
 @dataclass(frozen=True)
@@ -64,9 +64,9 @@ class Trajectory:
     每一帧都有观测,所以是稀疏列表而不是定长数组)。
     """
 
-    track_id: int
+    track_id: int  # 目标的唯一编号,贯穿全部下游断言(instance/interaction)
     present: tuple[int, int]  # (t_in, t_out),闭区间
-    per_frame: tuple[FramePresence, ...]
+    per_frame: tuple[FramePresence, ...]  # 按 t 严格升序排列的稀疏观测列表
 
     def __post_init__(self):
         """构造时做数据契约校验。下游多个模块(净位移取首末帧、KFA 等
@@ -144,9 +144,9 @@ class Fact:
 
     type: FactType
     scope: str  # "instance:<i>"(单目标事实) 或 "pair:<i>,<j>"(pair 事实)
-    value: object
-    t_span: tuple[int, int]
-    embed: tuple[float, ...]
+    value: object  # 确定性算出的原始取值,类型随 type 而变(数值/字符串/元组)
+    t_span: tuple[int, int]  # 该事实成立的帧号区间(闭区间)
+    embed: tuple[float, ...]  # 供 Fact Selector 打分用的定长向量,见下方约定
 
 
 @dataclass(frozen=True)
@@ -166,11 +166,11 @@ class PairFeature:
     视觉特征向量,加上确定性算出的相对几何关系。
     """
 
-    edge: tuple[int, int]
-    t: int
-    vis_i: tuple[float, ...]
-    vis_j: tuple[float, ...]
-    rel_geom: RelGeom
+    edge: tuple[int, int]  # (track_id_i, track_id_j),候选交互对
+    t: int  # 该特征所属的候选帧号
+    vis_i: tuple[float, ...]  # 目标 i 在帧 t 的视觉特征向量
+    vis_j: tuple[float, ...]  # 目标 j 在帧 t 的视觉特征向量
+    rel_geom: RelGeom  # i、j 之间确定性算出的相对几何关系
 
 
 @dataclass(frozen=True)
@@ -180,13 +180,14 @@ class InstanceAssertion:
     这就是"可归因"的落地形式。
     """
 
-    track_id: int
-    caption: str
-    time_span: tuple[int, int]
-    evidence_frames: tuple[int, ...]
-    type: str = "instance"
+    track_id: int  # 描述对象的目标编号
+    caption: str  # MLLM 生成的一句话行为描述
+    time_span: tuple[int, int]  # 描述所覆盖的帧号区间(闭区间)
+    evidence_frames: tuple[int, ...]  # 生成该描述时实际喂给 MLLM 的关键帧号
+    type: str = "instance"  # 输出 JSON 里的判别字段,固定值
 
     def to_json_dict(self) -> dict:
+        """序列化为可直接 json.dumps 的 dict(tuple 转 list)。"""
         return _asdict_json(self)
 
 
@@ -197,17 +198,18 @@ class InteractionAssertion:
     证据帧,可用于交互指标(role/direction/F1)的评测。
     """
 
-    subject_id: int
-    object_id: int
+    subject_id: int  # 交互发起方的目标编号
+    object_id: int  # 交互承受方的目标编号
     predicate: str  # MLLM 原始输出的开放谓词(未规范化)
     canonical_label: str  # 映射到规范谓词表之后的标签
-    time_span: tuple[int, int]
-    evidence_frames: tuple[int, ...]
-    direction: str = "subj->obj"
-    confidence: float = 1.0
-    type: str = "interaction"
+    time_span: tuple[int, int]  # 交互成立的帧号区间(闭区间)
+    evidence_frames: tuple[int, ...]  # 生成该断言时实际喂给 MLLM 的关键帧号
+    direction: str = "subj->obj"  # 方向标记,目前固定为 subject -> object
+    confidence: float = 1.0  # 置信度,预留字段(当前恒为 1.0)
+    type: str = "interaction"  # 输出 JSON 里的判别字段,固定值
 
     def to_json_dict(self) -> dict:
+        """序列化为可直接 json.dumps 的 dict(tuple 转 list)。"""
         return _asdict_json(self)
 
 
@@ -215,9 +217,10 @@ class InteractionAssertion:
 class VideoAssertion:
     """整段视频级别的概括断言:一句话总结 + 涉及到的所有 track_id。"""
 
-    summary: str
-    involved_ids: tuple[int, ...]
-    type: str = "video"
+    summary: str  # MLLM 生成的整段视频概括
+    involved_ids: tuple[int, ...]  # 概括中涉及到的全部目标编号
+    type: str = "video"  # 输出 JSON 里的判别字段,固定值
 
     def to_json_dict(self) -> dict:
+        """序列化为可直接 json.dumps 的 dict(tuple 转 list)。"""
         return _asdict_json(self)

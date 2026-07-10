@@ -73,15 +73,18 @@ def load_frozen_qwen(
     if quantize_4bit:
         from transformers import BitsAndBytesConfig
 
+        # nf4 + bf16 计算精度:在 8GB 级显卡上把权重显存压到约 1/4,
+        # 计算仍用 bf16(精度换算开销可接受),否则整卡装不下 2B 模型
+        # 加上训练侧的可学习模块 + 激活值。
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_quant_type="nf4",
         )
     model = AutoModelForMultimodalLM.from_pretrained(model_id, **kwargs)
-    model.eval()
+    model.eval()  # 关闭 dropout 等训练专属行为;冻结模型永远不切回 train()
     for param in model.parameters():
-        param.requires_grad_(False)
+        param.requires_grad_(False)  # 冻结边界:这个循环之后,模型的任何参数都不再收梯度
     return model, processor
 
 
@@ -124,6 +127,9 @@ def teacher_forced_loss(model, processor, messages, soft_tokens, target_text: st
     soft_tokens: (m, d_llm) 张量或 None(无 soft token 的对照/消融)。
     """
     device = model.device
+    # add_generation_prompt=True:模板末尾补上 "<|im_start|>assistant\n"
+    # 这类生成头,使得后面拼接的 target_ids 恰好接在"该模型开始说话"的
+    # 位置——这正是教师强制训练要构造的输入形状。
     inputs = processor.apply_chat_template(
         messages,
         tokenize=True,
@@ -142,6 +148,8 @@ def teacher_forced_loss(model, processor, messages, soft_tokens, target_text: st
             position=soft_token_position(processor, messages, inputs),
         )
 
+    # 目标句单独 tokenize(不加特殊 token,避免重复的 BOS 等),
+    # 手动补一个 EOS,让模型学会在说完目标句后正确停止生成。
     target_ids = processor.tokenizer(
         target_text, return_tensors="pt", add_special_tokens=False
     ).input_ids.to(device)
@@ -150,17 +158,21 @@ def teacher_forced_loss(model, processor, messages, soft_tokens, target_text: st
     )
 
     prompt_ids = inputs["input_ids"]
-    full_ids = torch.cat([prompt_ids, target_ids], dim=1)
+    full_ids = torch.cat([prompt_ids, target_ids], dim=1)  # 完整序列 = prompt + 目标句
+    # labels 的 -100 是 CE loss 的忽略索引:prompt/soft 段不参与 loss
+    # (模型不需要"预测"我们已知的输入),只有目标句部分计入训练信号。
     labels = torch.cat([torch.full_like(prompt_ids, -100), target_ids], dim=1)
     forward_kwargs = {
         "input_ids": full_ids,
-        "attention_mask": torch.ones_like(full_ids),
+        "attention_mask": torch.ones_like(full_ids),  # 单条样本,无 padding,全部有效
         "labels": labels,
     }
     for key in ("pixel_values", "image_grid_thw"):
         if inputs.get(key) is not None:
-            forward_kwargs[key] = inputs[key]
+            forward_kwargs[key] = inputs[key]  # 视觉塔输入(图像存在时才有)
     if inputs.get("mm_token_type_ids") is not None:
+        # 目标句部分不是多模态 token,补 0(与 attention_mask 的"全部有效"
+        # 不同维度:这里标记的是"是不是图像占位符",不是"是否参与 loss")。
         forward_kwargs["mm_token_type_ids"] = torch.cat(
             [inputs["mm_token_type_ids"], torch.zeros_like(target_ids)], dim=1
         )
@@ -184,14 +196,19 @@ def append_placeholder_tokens(
     filler = torch.full((ids.shape[0], m), pad_id, dtype=ids.dtype, device=ids.device)
 
     def insert(tensor, fill):
+        # 三段拼接:position 之前保持原样,中间插入 m 个占位,position 之后原样接上。
         return torch.cat([tensor[:, :start], fill, tensor[:, start:]], dim=1)
 
     inputs["input_ids"] = insert(ids, filler)
     if inputs.get("attention_mask") is not None:
+        # 占位 token 参与注意力计算(mask=1),因为它们最终会被替换成
+        # 真正的 soft 向量,不是要被忽略的 padding。
         inputs["attention_mask"] = insert(
             inputs["attention_mask"], torch.ones_like(filler)
         )
     if inputs.get("mm_token_type_ids") is not None:
+        # 标记为"非图像占位符"(0):soft token 走 embedding hook 注入,
+        # 不是视觉塔产出的图像 token,不应被模型当成图像特征处理。
         inputs["mm_token_type_ids"] = insert(
             inputs["mm_token_type_ids"], torch.zeros_like(filler)
         )
@@ -210,6 +227,8 @@ def soft_token_position(processor, messages, inputs) -> int:
     位置。防御性校验它确实是完整 prompt 的前缀——万一未来某个模板不
     满足前缀关系,退回"末尾追加"而不是插错位置。
     """
+    # 不带 generation prompt 的模板长度,恰好就是"用户回合结束"的位置——
+    # 带 generation prompt 的版本只是在它后面多追加了固定的助手回合头。
     without_gen = processor.apply_chat_template(
         messages,
         tokenize=True,
@@ -220,9 +239,11 @@ def soft_token_position(processor, messages, inputs) -> int:
     full_ids = inputs["input_ids"]
     prefix_ids = without_gen["input_ids"].to(full_ids.device)
     n = prefix_ids.shape[1]
+    # 防御性校验:确认 without_gen 真的是 inputs(带 generation prompt)的
+    # 前缀,而不是意外分叉的两段不同 token 序列。
     if n <= full_ids.shape[1] and bool(torch.equal(full_ids[:, :n], prefix_ids)):
         return n
-    return full_ids.shape[1]
+    return full_ids.shape[1]  # 校验失败:退回末尾追加,不冒险插错位置
 
 
 @contextlib.contextmanager
@@ -236,19 +257,24 @@ def soft_token_injection(model, soft: Optional[torch.Tensor], start_pos: int):
     (generate 的增量步)自动跳过。
     """
     if soft is None or soft.shape[0] == 0:
-        yield
+        yield  # 无 soft token:不挂 hook,行为等同直接调用模型
         return
     end_pos = start_pos + soft.shape[0]
 
     def hook(_module, _args, output):
+        # output: embedding 层的输出,形状 (B, seq_len, d_llm)。
+        # seq_len < end_pos 说明这次前向还没覆盖到注入区间(比如
+        # generate() 的增量解码步,每步只喂 1 个新 token)——原样放行。
         if output.shape[1] >= end_pos:
-            patched = output.clone()
+            patched = output.clone()  # clone 而非原地改:不破坏 autograd 对原张量的追踪
             patched[:, start_pos:end_pos] = soft.to(
                 dtype=output.dtype, device=output.device
             )
             return patched
         return output
 
+    # register_forward_hook 返回的 handle 必须在作用域结束时移除,
+    # 否则这个 hook 会一直挂在模型上,污染之后所有不带 soft token 的前向。
     handle = model.get_input_embeddings().register_forward_hook(hook)
     try:
         yield
@@ -305,7 +331,7 @@ class QwenMLLMAdapter:
 
         soft = None
         start = 0
-        if request.soft_tokens:
+        if request.soft_tokens:  # NoOpProjector 输出空 tuple 时这里恒为假,行为等同 Stage-0
             soft = torch.tensor(
                 request.soft_tokens, dtype=torch.float32, device=self._model.device
             )
@@ -321,7 +347,9 @@ class QwenMLLMAdapter:
                 position=soft_token_position(self._processor, messages, inputs),
             )
 
-        prompt_len = inputs["input_ids"].shape[1]
+        prompt_len = inputs["input_ids"].shape[1]  # 用来从输出里切掉回显的 prompt 部分
+        # inference_mode:纯推理,不建计算图(比 no_grad 更彻底、更省显存);
+        # do_sample=False:贪心解码,保证同一输入每次生成结果确定、可复现。
         with torch.inference_mode(), soft_token_injection(self._model, soft, start):
             output_ids = self._model.generate(
                 **inputs, max_new_tokens=self._max_new_tokens, do_sample=False
@@ -340,7 +368,7 @@ class QwenMLLMAdapter:
         没有关键帧(video 任务)时返回空列表,退化为纯文本请求。"""
         if not request.video_path or not request.frame_refs:
             return []
-        if self._provider_path != request.video_path:
+        if self._provider_path != request.video_path:  # 换了一个新视频,重建帧提供者
             self._provider = provider_for(request.video_path)
             self._provider_path = request.video_path
         boxes_by_t = {t: dict(entries) for t, entries in request.frame_boxes}
@@ -349,7 +377,7 @@ class QwenMLLMAdapter:
             image = self._provider.frame(t)
             boxes = boxes_by_t.get(t)
             if boxes:
-                image = annotate_boxes(image, boxes)
+                image = annotate_boxes(image, boxes)  # 画框做视觉 grounding
             images.append(image)
         return images
 

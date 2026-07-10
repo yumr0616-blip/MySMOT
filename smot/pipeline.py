@@ -54,6 +54,8 @@ class CostReport:
     n_soft_tokens: int = 0  # 所有请求携带的 soft token 总数(Stage-0 恒为 0)
 
     def to_json_dict(self) -> dict:
+        """序列化为可直接 json.dumps 的 dict(普通 dataclass,字段全是标量,
+        用标准库 asdict 即可,不需要 types.py 里那套 tuple/Enum 处理)。"""
         return asdict(self)
 
 
@@ -86,12 +88,12 @@ def _pool_embeds(facts: tuple[Fact, ...]) -> tuple[float, ...]:
     """
     if not facts:
         return ()
-    dim = len(facts[0].embed)
+    dim = len(facts[0].embed)  # 所有 Fact.embed 都是固定 4 维(见 types.py 约定)
     sums = [0.0] * dim
     for fact in facts:
         for i in range(dim):
             sums[i] += fact.embed[i]
-    return tuple(s / len(facts) for s in sums)
+    return tuple(s / len(facts) for s in sums)  # 逐维算术平均
 
 
 def _frame_boxes(key_frames, trajs: dict[int, Trajectory]):
@@ -104,8 +106,8 @@ def _frame_boxes(key_frames, trajs: dict[int, Trajectory]):
     for t in key_frames:
         entries = tuple(
             (tid, fp.box)
-            for tid, traj in sorted(trajs.items())
-            if (fp := traj.frame_at(t)) is not None
+            for tid, traj in sorted(trajs.items())  # 按 track_id 排序,输出顺序确定
+            if (fp := traj.frame_at(t)) is not None  # 用海象运算符边查边过滤缺观测的 track
         )
         boxes.append((t, entries))
     return tuple(boxes)

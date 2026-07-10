@@ -33,6 +33,7 @@ UNVERIFIED_DIRECTION_CONFIDENCE = 0.5
 
 
 def _is_interaction_item(obj) -> bool:
+    """判断一个解析出的 JSON 值是否"长得像"一条交互记录(带 predicate 键的 dict)。"""
     return isinstance(obj, dict) and "predicate" in obj
 
 
@@ -199,7 +200,7 @@ class OutputAssembler:
             )
 
         assertions: list[InteractionAssertion] = []
-        seen: set[tuple[int, int, str]] = set()
+        seen: set[tuple[int, int, str]] = set()  # (subj, obj, predicate小写) 去重键
         for item in structured:
             predicate = str(item["predicate"]).strip()
             if not predicate:
@@ -216,7 +217,7 @@ class OutputAssembler:
             )
             key = (subj, obj, predicate.lower())
             if key in seen:
-                continue
+                continue  # 同一条交互模型重复给出(或大小写不同的同义写法),只留一条
             seen.add(key)
             assertions.append(
                 InteractionAssertion(

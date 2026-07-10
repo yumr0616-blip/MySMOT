@@ -37,15 +37,17 @@ COARSE_MAP: dict[str, str] = {
 class PRF:
     """一次匹配的 precision / recall / F1 及其计数基数。"""
 
-    precision: float
-    recall: float
-    f1: float
-    n_pred: int
-    n_gold: int
-    n_matched: int
+    precision: float  # n_matched / n_pred:预测里有多少是对的
+    recall: float  # n_matched / n_gold:标注里有多少被找到了
+    f1: float  # precision 和 recall 的调和平均
+    n_pred: int  # 预测断言总数
+    n_gold: int  # 标注(gold)断言总数
+    n_matched: int  # 匹配上的断言数
 
     @classmethod
     def from_counts(cls, n_matched: int, n_pred: int, n_gold: int) -> "PRF":
+        """按三个计数直接算出 precision/recall/f1;分母为 0 时约定为 0
+        (而不是抛 ZeroDivisionError 或返回 NaN),让批量评测不用逐处判空。"""
         precision = n_matched / n_pred if n_pred else 0.0
         recall = n_matched / n_gold if n_gold else 0.0
         f1 = (
@@ -56,6 +58,7 @@ class PRF:
         return cls(precision, recall, f1, n_pred, n_gold, n_matched)
 
     def to_json_dict(self) -> dict:
+        """序列化为可直接 json.dumps 的 dict。"""
         return asdict(self)
 
 
@@ -72,6 +75,12 @@ def _mapped_label(assertion: dict, label_map: Optional[dict[str, str]]) -> str:
 def _interaction_key(
     assertion: dict, label_map: Optional[dict[str, str]], require_direction: bool
 ) -> tuple:
+    """把一条交互断言压成用于计数/匹配的 hashable 键。
+
+    require_direction=True 时键是 (subject_id, object_id, 标签),方向
+    不同判为不同键;=False 时先把 id 对排序,方向不同也会被算作同一键
+    (用于"事件本身是否找对"而不关心方向的匹配,见 direction_accuracy)。
+    """
     ids = (assertion["subject_id"], assertion["object_id"])
     if not require_direction:
         ids = tuple(sorted(ids))
@@ -94,6 +103,9 @@ def match_interactions(
     gold_keys = Counter(
         _interaction_key(a, label_map, require_direction) for a in gold
     )
+    # Counter & Counter 是"多重集交集":同一个键取两边计数的较小值。
+    # 比如 pred 里同一个 (subj, obj, label) 出现 3 次、gold 里出现 2 次,
+    # 交集算 2——防止用一条 gold 断言反复"兑现"多条重复的 pred 断言。
     n_matched = sum((pred_keys & gold_keys).values())
     return PRF.from_counts(n_matched, len(pred), len(gold))
 
@@ -123,11 +135,13 @@ def direction_accuracy(
 
 def _time_iou(span_a: list[int], span_b: list[int]) -> float:
     """两个闭区间帧号段的时间 IoU(按包含的帧数计,闭区间所以 +1)。"""
+    # 交集区间 = 两段各自取"内侧"端点(起点取 max,终点取 min);
+    # 并集区间 = 两段各自取"外侧"端点(起点取 min,终点取 max)。
     inter = min(span_a[1], span_b[1]) - max(span_a[0], span_b[0]) + 1
     union = max(span_a[1], span_b[1]) - min(span_a[0], span_b[0]) + 1
     if union <= 0:
         return 0.0
-    return max(0, inter) / union
+    return max(0, inter) / union  # 两段不重叠时 inter 为负,截断为 0
 
 
 def instance_coverage(pred: list[dict], gold: list[dict]) -> dict:
@@ -140,13 +154,13 @@ def instance_coverage(pred: list[dict], gold: list[dict]) -> dict:
     gold_by_id = {a["track_id"]: a for a in gold}
     if not gold_by_id:
         return {"track_coverage": 0.0, "mean_time_iou": 0.0, "n_pred": len(pred), "n_gold": 0}
-    common = sorted(set(pred_by_id) & set(gold_by_id))
+    common = sorted(set(pred_by_id) & set(gold_by_id))  # 两边都给出了 caption 的 track_id
     ious = [
         _time_iou(pred_by_id[i]["time_span"], gold_by_id[i]["time_span"]) for i in common
     ]
     return {
-        "track_coverage": len(common) / len(gold_by_id),
-        "mean_time_iou": sum(ious) / len(ious) if ious else 0.0,
+        "track_coverage": len(common) / len(gold_by_id),  # gold 里有多少比例被覆盖到
+        "mean_time_iou": sum(ious) / len(ious) if ious else 0.0,  # 覆盖到的部分,时间段对得多准
         "n_pred": len(pred),
         "n_gold": len(gold_by_id),
     }
@@ -189,6 +203,11 @@ def evaluate(
     if coarse_map is None:
         coarse_map = COARSE_MAP
 
+    # 三层评测粒度,每层是 (label_map, require_direction) 的一组配置:
+    #   strict         用原始规范标签,方向必须对;
+    #   synonym_merged 用调用方传入的同义词表折叠标签,方向仍需对;
+    #   coarse         用粗粒度表折叠标签,且不要求方向(粗粒度下方向
+    #                   往往没有细分意义)。
     tiers = {
         "strict": (None, True),
         "synonym_merged": (synonym_map, True),
@@ -203,10 +222,14 @@ def evaluate(
         for name, (label_map, require_direction) in tiers.items():
             prf = match_interactions(p_inter, g_inter, label_map, require_direction)
             counts = tier_counts[name]
+            # 累加计数而不是逐视频算 PRF 再平均——这是 micro 平均:
+            # 视频越大(断言越多)对总分的影响越大,而不是每个视频等权。
             counts[0] += prf.n_matched
             counts[1] += prf.n_pred
             counts[2] += prf.n_gold
-        # 方向准确率的分子/分母也跨视频累加(micro 平均)。
+        # 方向准确率的分子/分母也跨视频累加(micro 平均);这里直接展开
+        # 而不是复用 direction_accuracy(),因为需要跨视频累加分子分母,
+        # 而不是每个视频各算一个比例再平均。
         pred_und = Counter(_interaction_key(a, None, False) for a in p_inter)
         gold_und = Counter(_interaction_key(a, None, False) for a in g_inter)
         dir_matched_total += sum((pred_und & gold_und).values())
@@ -217,6 +240,8 @@ def evaluate(
             instance_coverage(pred.get("instances", []), gold.get("instances", []))
         )
 
+    # instance 覆盖率同样按 track 总数做 micro 加权(而不是对每个视频的
+    # track_coverage 简单平均),视频里 track 越多权重越大。
     n_gold_tracks = sum(c["n_gold"] for c in coverage_accum)
     covered = sum(c["track_coverage"] * c["n_gold"] for c in coverage_accum)
     iou_weighted = [
@@ -240,6 +265,7 @@ def evaluate(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    """命令行入口:读两个 JSON 文件跑 evaluate(),把结果 pretty-print 到 stdout。"""
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) != 2:
         print("用法: python -m smot.eval <pred.json> <gold.json>", file=sys.stderr)

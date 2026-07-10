@@ -29,19 +29,19 @@ def build_pair_features(
     edge = (traj_i.track_id, traj_j.track_id)
     features: list[PairFeature] = []
     prev: tuple[int, tuple[float, float], tuple[float, float]] | None = None  # (t, ci, cj)
-    for t in sorted(set(ts)):
+    for t in sorted(set(ts)):  # sorted+set:去重且保证按时间顺序差分
         fp_i, fp_j = traj_i.frame_at(t), traj_j.frame_at(t)
         if fp_i is None or fp_j is None:
-            continue
+            continue  # 双方缺一,这一帧的"相对"几何没有意义,跳过而非补零
         ci, cj = centroid(fp_i.box), centroid(fp_j.box)
         if prev is None:
-            rel_vel = (0.0, 0.0)
+            rel_vel = (0.0, 0.0)  # 第一个双方都有观测的帧,没有历史帧可差分
         else:
             t_prev, ci_prev, cj_prev = prev
-            dt = float(t - t_prev)
+            dt = float(t - t_prev)  # 注意:是与"上一个共同观测帧"的间隔,可能 >1
             vel_i = ((ci[0] - ci_prev[0]) / dt, (ci[1] - ci_prev[1]) / dt)
             vel_j = ((cj[0] - cj_prev[0]) / dt, (cj[1] - cj_prev[1]) / dt)
-            rel_vel = (vel_j[0] - vel_i[0], vel_j[1] - vel_i[1])
+            rel_vel = (vel_j[0] - vel_i[0], vel_j[1] - vel_i[1])  # j 相对 i 的速度
         features.append(
             PairFeature(
                 edge=edge,
@@ -49,13 +49,13 @@ def build_pair_features(
                 vis_i=(),  # Stage-0 无视觉塔;Stage-1b 填真实特征
                 vis_j=(),
                 rel_geom=RelGeom(
-                    rel_pos=(cj[0] - ci[0], cj[1] - ci[1]),
+                    rel_pos=(cj[0] - ci[0], cj[1] - ci[1]),  # j 相对 i 的位移向量
                     dist=dist(ci, cj),
                     rel_vel=rel_vel,
-                    orient=orientation(ci, cj),
+                    orient=orientation(ci, cj),  # 从 i 指向 j 的方向角
                     overlap=iou(fp_i.box, fp_j.box),
                 ),
             )
         )
-        prev = (t, ci, cj)
+        prev = (t, ci, cj)  # 更新差分基准,供下一个共同观测帧使用
     return tuple(features)

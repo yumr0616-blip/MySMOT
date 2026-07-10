@@ -33,12 +33,14 @@ def make_fact_embed_normalizer(
     def normalize(facts: list[Fact]) -> list[Fact]:
         out: list[Fact] = []
         for fact in facts:
-            stat = stats.get(fact.type.value)
+            stat = stats.get(fact.type.value)  # 按事实类型(如 "speed")查统计量
             if not stat or stat.get("std", 0.0) <= 0.0:
-                out.append(fact)
+                out.append(fact)  # 没有统计量或标准差为 0:原样保留,不做变换
                 continue
-            embed = list(fact.embed)
-            embed[1] = (embed[1] - stat["mean"]) / stat["std"]
+            embed = list(fact.embed)  # tuple 不可原地修改,先转 list
+            embed[1] = (embed[1] - stat["mean"]) / stat["std"]  # 标准 z-score 公式
+            # Fact 是 frozen dataclass,不能直接赋值,用 dataclasses.replace
+            # 构造一个新实例(其余字段原样复制),保持不可变性契约。
             out.append(dataclasses.replace(fact, embed=tuple(embed)))
         return out
 

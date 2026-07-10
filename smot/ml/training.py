@@ -69,16 +69,16 @@ class _Example:
     interaction/video 的证据帧在构造时固定。"""
 
     task: str  # "instance" | "interaction" | "video"
-    seq: BenSMOTSequence
+    seq: BenSMOTSequence  # 该样本所属的完整序列(渲染帧时需要访问 imgs/ 目录)
     prompt_body: str  # prompts.py 构造的任务 prompt(不含图例/指令后缀)
     pooled_facts: tuple[float, ...]  # 4 维事实池化(已归一化)
-    target_text: str
+    target_text: str  # 教师强制的目标句(gold caption/JSON/summary)
     # instance 专用
-    track_id: Optional[int] = None
-    features: tuple[tuple[float, ...], ...] = ()
+    track_id: Optional[int] = None  # 描述哪个目标(仅 instance 任务)
+    features: tuple[tuple[float, ...], ...] = ()  # 该轨迹逐帧几何特征,喂给 KFA 打分
     # interaction 专用(固定证据帧;video 两者皆空)
-    static_frame_ts: tuple[int, ...] = ()
-    box_track_ids: tuple[int, ...] = ()
+    static_frame_ts: tuple[int, ...] = ()  # 预先算好的证据帧号(interaction 不跑 KFA 选帧)
+    box_track_ids: tuple[int, ...] = ()  # 需要画框的 track_id(instance 是自己,interaction 是双方)
 
 
 def build_examples(
@@ -239,15 +239,17 @@ def example_loss(
     """一条样本的完整前向:KFA(仅 instance)-> projector -> 渲染证据帧 ->
     共享的 teacher_forced_loss。返回可反传的 loss。"""
     traj_by_id = {traj.track_id: traj for traj in example.seq.trajectories}
-    pooled4 = torch.tensor(example.pooled_facts, dtype=torch.float32, device=device)
+    pooled4 = torch.tensor(example.pooled_facts, dtype=torch.float32, device=device)  # 4 维事实池化
 
     if example.task == "instance":
         features = torch.tensor(example.features, dtype=torch.float32, device=device)
+        # KFA 走 forward()(不是 select()):训练需要 soft_vector 留在计算图里,
+        # select() 内部的 no_grad 会切断梯度,只适合推理。
         hard_indices, soft_vector = kfa(features, top_k=top_k_frames)
         traj = traj_by_id[example.track_id]
         frame_ts = tuple(sorted(traj.per_frame[i].t for i in hard_indices.tolist()))
         box_track_ids = (example.track_id,)
-        pooled = torch.cat([pooled4, soft_vector])
+        pooled = torch.cat([pooled4, soft_vector])  # 4 维事实 + KFA soft 向量拼接
     else:
         # 无 unary soft 向量的任务:KFA 分量按零补齐(与推理侧
         # projector.project 的缺失语义一致),KFA 不参与本条样本的梯度。
@@ -259,6 +261,8 @@ def example_loss(
 
     soft_tokens = projector(pooled).squeeze(0)  # (n_tokens, d_llm)
 
+    # 逐证据帧收集 box_track_ids 里每个 track 在该帧的框(缺观测则跳过),
+    # 与 Pipeline._frame_boxes 的形状约定完全一致,供画框/推理侧复用同一份 compose_prompt_text。
     frame_boxes = tuple(
         (
             t,
@@ -273,6 +277,8 @@ def example_loss(
     boxes_by_t = {t: dict(entries) for t, entries in frame_boxes}
     images = renderer.render(example.seq, frame_ts, boxes_by_t) if frame_ts else []
 
+    # 与推理侧 QwenMLLMAdapter 完全同构的 prompt 组装(同一个 compose_prompt_text),
+    # 这是"训练看到的输入分布 == 推理看到的输入分布"的关键保证。
     text = compose_prompt_text(
         example.task, example.prompt_body, frame_boxes, has_images=bool(images)
     )
@@ -310,6 +316,9 @@ def train(args) -> dict:
         args.model_id, device=device, quantize_4bit=args.quantize_4bit
     )
     if args.grad_checkpoint:
+        # 用计算换显存:反向传播时重算前向激活值而不是全部缓存,
+        # use_reentrant=False 是 PyTorch 推荐的新实现(兼容性更好)。
+        # 8GB 显卡跑 2B 多模态模型的训练前向,不开这个大概率 OOM。
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
@@ -318,15 +327,15 @@ def train(args) -> dict:
 
     kfa = LearnableUnaryKFA().to(device)
     projector = MLPProjector(
-        in_dim=len(examples[0].pooled_facts) + kfa.out_dim,
+        in_dim=len(examples[0].pooled_facts) + kfa.out_dim,  # 4 维事实 + KFA soft 向量维度
         d_llm=embedding.embedding_dim,
         n_tokens=args.n_tokens,
-        output_gain=embed_rms,
+        output_gain=embed_rms,  # 见 MLPProjector 模块 docstring:对齐冻结 LM 词嵌入尺度
     ).to(device)
     kfa.train()
     projector.train()
     trainable = list(itertools.chain(kfa.parameters(), projector.parameters()))
-    optimizer = torch.optim.AdamW(trainable, lr=args.lr)
+    optimizer = torch.optim.AdamW(trainable, lr=args.lr)  # 只优化这两个模块,冻结 MLLM 不在内
     n_trainable = sum(p.numel() for p in trainable)
     print(f"[模型] 可训练参数 {n_trainable/1e3:.1f}K,d_llm={embedding.embedding_dim},"
           f" embed_rms={embed_rms:.4f}", file=sys.stderr)
@@ -367,10 +376,10 @@ def train(args) -> dict:
                     model, processor, kfa, projector, example,
                     renderer, args.top_k_frames, device,
                 )
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(trainable, args.clip_norm)
+                loss.backward()  # 单样本一步(无 batch 维度累积),梯度只流向 kfa/projector
+                torch.nn.utils.clip_grad_norm_(trainable, args.clip_norm)  # 防止个别样本梯度爆炸
                 optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=True)  # set_to_none 比清零张量更省一次写显存
 
                 step += 1
                 loss_value = float(loss.detach())

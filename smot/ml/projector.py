@@ -33,18 +33,18 @@ class MLPProjector(nn.Module):
         output_gain: float = 1.0,
     ):
         super().__init__()
-        self.in_dim = in_dim
-        self.d_llm = d_llm
-        self.n_tokens = n_tokens
-        self.input_proj = nn.Linear(in_dim, hidden_dim)
-        self.block = nn.Sequential(
+        self.in_dim = in_dim  # 输入池化向量的维度(事实池化 4 维 [+ KFA soft 向量])
+        self.d_llm = d_llm  # 冻结 MLLM 的词嵌入维度,soft token 必须匹配这个维度
+        self.n_tokens = n_tokens  # 每次调用产出的 soft token 个数 m
+        self.input_proj = nn.Linear(in_dim, hidden_dim)  # 把小维度输入升到隐藏维
+        self.block = nn.Sequential(  # 单个残差块:LN -> Linear -> GELU -> Linear
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        self.out = nn.Linear(hidden_dim, n_tokens * d_llm)
-        self.norm = nn.LayerNorm(d_llm)
+        self.out = nn.Linear(hidden_dim, n_tokens * d_llm)  # 一次性输出 m 个 token 拼在一起
+        self.norm = nn.LayerNorm(d_llm)  # 对每个 token 的 d_llm 维分别归一化
         # output_gain 应传冻结 LM 词嵌入的 RMS(见模块 docstring):
         # LayerNorm 归一化到单位方差后,按嵌入尺度整体缩放。增益本身
         # 仍是可学习参数,这里只是初始化。
@@ -53,11 +53,11 @@ class MLPProjector(nn.Module):
     def forward(self, pooled: torch.Tensor) -> torch.Tensor:
         """pooled: (B, in_dim) 或 (in_dim,)。返回 (B, n_tokens, d_llm)。"""
         if pooled.dim() == 1:
-            pooled = pooled.unsqueeze(0)
-        hidden = self.input_proj(pooled)
-        hidden = hidden + self.block(hidden)  # 残差
-        tokens = self.out(hidden).reshape(-1, self.n_tokens, self.d_llm)
-        return self.norm(tokens)
+            pooled = pooled.unsqueeze(0)  # 补 batch 维,统一按 (B, in_dim) 处理
+        hidden = self.input_proj(pooled)  # (B, hidden_dim)
+        hidden = hidden + self.block(hidden)  # 残差:即使 block 学不到东西也不退化
+        tokens = self.out(hidden).reshape(-1, self.n_tokens, self.d_llm)  # 拆回 (B, m, d_llm)
+        return self.norm(tokens)  # LayerNorm 作用在最后一维(d_llm),逐 token 独立归一化
 
     def project(
         self, pooled_vector: tuple[float, ...]
@@ -80,11 +80,13 @@ class MLPProjector(nn.Module):
                 f"布线不匹配"
             )
         padded = tuple(pooled_vector) + (0.0,) * (self.in_dim - len(pooled_vector))
-        device = next(self.parameters()).device
-        with torch.no_grad():
+        device = next(self.parameters()).device  # 与模块权重同设备(CPU/CUDA)
+        with torch.no_grad():  # 推理路径不需要构建计算图,省显存/加速
             tokens = self.forward(
                 torch.tensor(padded, dtype=torch.float32, device=device)
             )
+        # 去掉 forward() 补上的 batch 维,搬回 CPU 转成纯 Python 嵌套 tuple
+        # (Protocol 约定的返回类型是 tuple,不是 tensor——推理侧不依赖 torch)。
         return tuple(
             tuple(float(v) for v in row) for row in tokens.squeeze(0).cpu()
         )

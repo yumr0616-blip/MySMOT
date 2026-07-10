@@ -37,14 +37,14 @@ class LearnableUnaryKFA(nn.Module):
         out_dim: int = 32,
     ):
         super().__init__()
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.scorer = nn.Sequential(
+        self.in_dim = in_dim  # 逐帧特征维度(默认等于 FRAME_FEATURE_DIM=9)
+        self.out_dim = out_dim  # soft 读出向量的维度,会拼进 projector 的输入
+        self.scorer = nn.Sequential(  # 每帧特征 -> 1 个显著性分数(标量)
             nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
-        self.value = nn.Linear(in_dim, out_dim)
+        self.value = nn.Linear(in_dim, out_dim)  # 每帧特征 -> out_dim 维"值"向量,供 soft 加权求和
 
     def forward(
         self, features: torch.Tensor, top_k: int
@@ -55,11 +55,11 @@ class LearnableUnaryKFA(nn.Module):
           hard_indices (k,)   分数 top-k 的帧下标(离散,无梯度);
           soft_vector (out_dim,) softmax 注意力加权的 value 读出(可导)。
         """
-        scores = self.scorer(features).squeeze(-1)  # (T,)
-        probs = torch.softmax(scores, dim=-1)
-        soft_vector = probs @ self.value(features)  # (out_dim,)
-        k = min(top_k, features.shape[0])
-        hard_indices = torch.topk(scores, k).indices
+        scores = self.scorer(features).squeeze(-1)  # (T, 1) -> (T,) 每帧一个分数
+        probs = torch.softmax(scores, dim=-1)  # 分数 -> 全体 T 帧上的注意力权重,和为 1
+        soft_vector = probs @ self.value(features)  # (T,) @ (T, out_dim) -> (out_dim,) 加权和
+        k = min(top_k, features.shape[0])  # 帧数不足 top_k 时,最多取全部帧
+        hard_indices = torch.topk(scores, k).indices  # 分数最高的 k 个帧下标(离散选择)
         return hard_indices, soft_vector
 
     def select(
@@ -90,8 +90,10 @@ class LearnableUnaryKFA(nn.Module):
             )
         device = next(self.parameters()).device
         feats = torch.tensor(features, dtype=torch.float32, device=device)
-        with torch.no_grad():
+        with torch.no_grad():  # 推理路径(select)不需要梯度;训练时走 forward() 本身
             hard_indices, soft_vector = self.forward(feats, top_k)
+        # hard_indices 是打分产生的下标顺序(未必按时间排序),转回帧号后
+        # 重新按时间排序,保证下游(渲染、prompt)看到的证据帧是时间有序的。
         key_frames = tuple(sorted(frames[i].t for i in hard_indices.tolist()))
-        soft_token = tuple(float(v) for v in soft_vector.cpu())
+        soft_token = tuple(float(v) for v in soft_vector.cpu())  # 转成纯 Python tuple,脱离 torch
         return KeyFrameSelection(key_frames=key_frames, soft_token=soft_token)

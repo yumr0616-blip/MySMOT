@@ -45,29 +45,29 @@ def geometric_frame_features(
     s = float(max(scale, 1e-6))
 
     features: list[tuple[float, ...]] = []
-    prev = None
+    prev = None  # 上一个观测帧,用来算帧间差分(速度/位移);首帧没有上一帧
     for fp in traj.per_frame:
         x1, y1, x2, y2 = fp.box
         cx, cy = centroid(fp.box)
         if prev is None:
-            speed = dx = dy = 0.0
+            speed = dx = dy = 0.0  # 首帧没有"上一帧"可比,运动量约定为 0
         else:
             dt = fp.t - prev.t  # Trajectory 构造已保证严格递增,dt >= 1
             pcx, pcy = centroid(prev.box)
-            dx = (cx - pcx) / dt
-            dy = (cy - pcy) / dt
-            speed = dist((pcx, pcy), (cx, cy)) / dt
+            dx = (cx - pcx) / dt  # x 方向位移速率(per 帧)
+            dy = (cy - pcy) / dt  # y 方向位移速率(per 帧)
+            speed = dist((pcx, pcy), (cx, cy)) / dt  # 标量速度(位移距离/dt)
         features.append(
             (
-                cx / s,
-                cy / s,
-                (x2 - x1) / s,
-                (y2 - y1) / s,
-                speed / s,
-                dx / s,
-                dy / s,
-                float(fp.conf),
-                fp.t / t_scale,
+                cx / s,  # [0] 中心点 x(归一化)
+                cy / s,  # [1] 中心点 y(归一化)
+                (x2 - x1) / s,  # [2] 框宽(归一化)
+                (y2 - y1) / s,  # [3] 框高(归一化)
+                speed / s,  # [4] 速度(归一化)
+                dx / s,  # [5] x 方向位移速率(归一化)
+                dy / s,  # [6] y 方向位移速率(归一化)
+                float(fp.conf),  # [7] 置信度/可见度,已在 [0,1] 无需再缩放
+                fp.t / t_scale,  # [8] 帧号归一化到 [0, 1]
             )
         )
         prev = fp

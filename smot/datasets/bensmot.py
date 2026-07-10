@@ -158,15 +158,15 @@ def parse_gt_txt(path: str | os.PathLike) -> tuple[Trajectory, ...]:
             if len(parts) < 6:
                 raise ValueError(f"{path}:{line_no}: gt 行列数不足 6: {line!r}")
             try:
-                t = int(float(parts[0]))
+                t = int(float(parts[0]))  # int(float(...)):容忍 "1.0" 这类带小数点的整数写法
                 track_id = int(float(parts[1]))
-                x, y, w, h = (float(v) for v in parts[2:6])
-                consider = float(parts[6]) if len(parts) >= 7 and parts[6] else 1.0
-                conf = float(parts[8]) if len(parts) >= 9 and parts[8] else 1.0
+                x, y, w, h = (float(v) for v in parts[2:6])  # 左上角坐标 + 宽高
+                consider = float(parts[6]) if len(parts) >= 7 and parts[6] else 1.0  # 第7列缺失时默认"考虑"
+                conf = float(parts[8]) if len(parts) >= 9 and parts[8] else 1.0  # 第9列缺失时默认满置信度
             except ValueError as exc:
                 raise ValueError(f"{path}:{line_no}: 无法解析 gt 行: {line!r}") from exc
             if consider == 0.0:
-                continue
+                continue  # MOT 的 consider=0 标记该行不应参与评测(如 distractor 类)
             # 真实标注里约 90 行(全量扫描确认)宽/高为负值——框拟合工具
             # 偶发的角点错序,不是转换器能预判的格式假设。按 min/max
             # 归一化角点(而非原样传播 x2<x1 的退化框):后续任何按
@@ -175,18 +175,18 @@ def parse_gt_txt(path: str | os.PathLike) -> tuple[Trajectory, ...]:
             x1, x2 = (x, x + w) if w >= 0 else (x + w, x)
             y1, y2 = (y, y + h) if h >= 0 else (y + h, y)
             per_frame = rows_by_id.setdefault(track_id, {})
-            per_frame.setdefault(
+            per_frame.setdefault(  # setdefault:同一 (id, frame) 重复出现时保留第一行
                 t, FramePresence(t=t, box=(x1, y1, x2, y2), conf=conf)
             )
     trajectories = []
-    for track_id in sorted(rows_by_id):
+    for track_id in sorted(rows_by_id):  # 按 track_id 升序,格式事实 #1 的映射依赖这个顺序
         frames = tuple(
-            rows_by_id[track_id][t] for t in sorted(rows_by_id[track_id])
+            rows_by_id[track_id][t] for t in sorted(rows_by_id[track_id])  # 按帧号升序排列
         )
         trajectories.append(
             Trajectory(
                 track_id=track_id,
-                present=(frames[0].t, frames[-1].t),
+                present=(frames[0].t, frames[-1].t),  # 首末观测帧号作为出现区间
                 per_frame=frames,
             )
         )
@@ -246,12 +246,15 @@ def _parse_graphml(path: str | os.PathLike) -> tuple[dict[str, str], list[_Graph
     (BenSMOT 的节点 id 预期直接就是 "woman0" 这类实例名)。
     """
     root = ET.parse(path).getroot()
+    # GraphML 的 <key> 元素声明了属性 id(如 "d0")到人类可读属性名
+    # (如 "relation")的映射;<data key="d0"> 里的 "d0" 必须经这张表翻译。
     key_names = {
         k.get("id"): (k.get("attr.name") or k.get("id"))
         for k in root.findall("g:key", _GRAPHML_NS)
     }
 
     def data_dict(element) -> dict[str, str]:
+        """把一个 <node>/<edge> 元素下的全部 <data> 子元素翻译成 {属性名: 值}。"""
         return {
             key_names.get(d.get("key"), d.get("key") or ""): (d.text or "").strip()
             for d in element.findall("g:data", _GRAPHML_NS)
@@ -263,7 +266,8 @@ def _parse_graphml(path: str | os.PathLike) -> tuple[dict[str, str], list[_Graph
         for node in graph.findall("g:node", _GRAPHML_NS):
             node_id = node.get("id") or ""
             data = data_dict(node)
-            display = node_id
+            display = node_id  # 默认显示名就是节点 id 本身
+            # 按提示词优先级依次找:命中即用该属性值覆盖 display 并跳出双重循环。
             for hint in _NODE_NAME_KEY_HINTS:
                 for key, value in data.items():
                     if hint in key.casefold() and value:
@@ -284,6 +288,8 @@ def _parse_graphml(path: str | os.PathLike) -> tuple[dict[str, str], list[_Graph
 
 
 def _looks_numeric(value: str) -> bool:
+    """value 能否解析成浮点数——用来把"数值型属性"(如帧号)与"文本型
+    属性"(如谓词)区分开,而不是硬编码属性名。"""
     try:
         float(value)
         return True
@@ -305,16 +311,19 @@ def parse_predicates(value: str) -> tuple[str, ...]:
     同一条边内去重、保持出现顺序。
     """
     out: list[str] = []
-    for part in value.split(","):
+    for part in value.split(","):  # 主体形态是逗号分隔的 synset 列表
         part = part.strip()
         if not part:
             continue
-        synsets = _SYNSET_RE.findall(part)
+        synsets = _SYNSET_RE.findall(part)  # 一个 part 里可能连写多个 synset(标注笔误)
         if synsets:
-            out.extend(s.replace("_", " ").lower() for s in synsets)
+            out.extend(s.replace("_", " ").lower() for s in synsets)  # lemma 下划线还原成空格
         else:
-            out.append(part.replace("_", " ").lower())
+            out.append(part.replace("_", " ").lower())  # 不匹配 synset 形态的裸词,原样小写保留
     seen: set[str] = set()
+    # `p in seen or seen.add(p)` 是保序去重的惯用写法:or 的短路特性让
+    # add() 只在"没见过"时执行(add 返回 None,恒为假,不影响 or 的结果),
+    # 同时把 p 记进 seen 供后续元素判重。
     unique = [p for p in out if not (p in seen or seen.add(p))]
     return tuple(unique)
 
@@ -378,7 +387,7 @@ def _resolve_graphml_nodes(
     后缀是按类别各自计数的,不能单独当顺序用)。位置映射下节点数超出
     轨迹数的溢出节点不进映射,引用它们的边由调用方丢弃。
     """
-    norm = {name.strip().casefold(): tid for name, tid in name_to_id.items()}
+    norm = {name.strip().casefold(): tid for name, tid in name_to_id.items()}  # 大小写/空格不敏感的查找表
 
     def by_name(node_id: str) -> Optional[int]:
         display = node_names.get(node_id, node_id) or node_id
@@ -386,7 +395,9 @@ def _resolve_graphml_nodes(
 
     resolved = {nid: by_name(nid) for nid in node_names}
     if resolved and all(tid is not None for tid in resolved.values()):
-        return resolved  # type: ignore[return-value]
+        return resolved  # type: ignore[return-value]  # 全部节点都按名字解析成功,直接采用
+    # 只要有一个节点名对不上,就不信任名字映射,整体退回位置映射
+    # (格式事实 #3:标注工具按人物顺序生成节点,不是按数字后缀排序)。
     ordered = sorted(track_ids)
     return {
         nid: ordered[i] for i, nid in enumerate(node_names) if i < len(ordered)
@@ -421,7 +432,7 @@ def graphml_to_interactions(
         subject_id = node_to_tid.get(edge.source)
         object_id = node_to_tid.get(edge.target)
         if subject_id is None or object_id is None or subject_id == object_id:
-            continue
+            continue  # 解析不出 id(溢出节点)或自环边,丢弃比错配到随机 track 更安全
         value = _pick_predicate(edge.data, context)
         time_span = _span_from_edge_data(edge.data) or _default_pair_span(
             traj_by_id[subject_id], traj_by_id[object_id]
@@ -465,7 +476,7 @@ def load_sequence(seq_dir: str | os.PathLike) -> BenSMOTSequence:
     video_caption = (
         video_caption_path.read_text(encoding="utf-8-sig").strip()
         if video_caption_path.is_file()
-        else ""
+        else ""  # 允许缺失,退化为空概括(不进 video 任务的训练/评测)
     )
 
     traj_by_id = {traj.track_id: traj for traj in trajectories}
@@ -473,13 +484,14 @@ def load_sequence(seq_dir: str | os.PathLike) -> BenSMOTSequence:
     interactions = (
         graphml_to_interactions(graphml_path, name_to_id, traj_by_id)
         if graphml_path.is_file()
-        else ()
+        else ()  # 允许缺失,退化为"这段序列没有交互标注"
     )
 
     imgs_dir = seq / "imgs"
     if imgs_dir.is_dir():
         num_frames = sum(1 for p in imgs_dir.iterdir() if p.is_file())
     else:
+        # 没有图像目录(如某些测试 fixture)时,用轨迹里出现过的最大帧号兜底。
         num_frames = max((traj.present[1] for traj in trajectories), default=0)
 
     return BenSMOTSequence(
@@ -505,7 +517,7 @@ def iter_sequences(root: str | os.PathLike) -> Iterator[Path]:
         yield root_path
         return
     for dirpath, dirnames, _filenames in os.walk(root_path):
-        dirnames.sort()
+        dirnames.sort()  # 原地排序 os.walk 的下钻列表,决定后续子目录的遍历顺序
         current = Path(dirpath)
         if (current / "gt" / "gt.txt").is_file():
             dirnames.clear()  # 序列目录内部不再下钻
@@ -589,21 +601,25 @@ def build_gold_payloads(sequences: list[BenSMOTSequence]) -> list[dict]:
 class _RunningStat:
     """Welford 在线均值/方差(总体标准差),避免两遍扫描或数值溢出。"""
 
-    __slots__ = ("n", "mean", "_m2")
+    __slots__ = ("n", "mean", "_m2")  # 三个累计量之外不存原始数据,内存 O(1) 而非 O(样本数)
 
     def __init__(self) -> None:
         self.n = 0
         self.mean = 0.0
-        self._m2 = 0.0
+        self._m2 = 0.0  # 与当前 mean 的离差平方和(sum of squared deviations)
 
     def add(self, x: float) -> None:
+        """喂入一个新样本,增量更新 n/mean/_m2(Welford 算法核心三行)。"""
         self.n += 1
-        delta = x - self.mean
-        self.mean += delta / self.n
-        self._m2 += delta * (x - self.mean)
+        delta = x - self.mean  # 新样本相对"旧"均值的离差
+        self.mean += delta / self.n  # 更新均值
+        self._m2 += delta * (x - self.mean)  # 注意第二个 (x - self.mean) 用的是"新"均值——
+        # 这个看似不对称的写法正是 Welford 算法数值稳定的关键,等价于但避免了
+        # sum((x-mean)^2) 两遍扫描或 sum(x^2)-n*mean^2 的大数相减误差。
 
     @property
     def std(self) -> float:
+        """总体标准差(除以 n,不是 n-1 的样本标准差)。"""
         return math.sqrt(self._m2 / self.n) if self.n else 0.0
 
 
@@ -615,13 +631,13 @@ def compute_fact_statistics(sequences: list[BenSMOTSequence]) -> dict:
     输入需要跨数据集可比的数值尺度,训练侧将用这里的统计量做 z-score。
     """
     extractor = MotionFactExtractor()
-    stats: dict[str, _RunningStat] = {}
+    stats: dict[str, _RunningStat] = {}  # 按事实类型(如 "speed")各维护一份在线统计
     for seq in sequences:
         for fact in extractor.extract(list(seq.trajectories)):
             stats.setdefault(fact.type.value, _RunningStat()).add(float(fact.embed[1]))
     return {
         fact_type: {"n": s.n, "mean": s.mean, "std": s.std}
-        for fact_type, s in sorted(stats.items())
+        for fact_type, s in sorted(stats.items())  # 排序保证输出 JSON 的键顺序确定、可复现
     }
 
 

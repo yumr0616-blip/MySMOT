@@ -99,11 +99,14 @@ def main() -> int:
                 proximity_trigger=True,
             ),
         }
-        if kfa is not None:
+        if kfa is not None:  # 只有传了 --checkpoint 才用可学习组件,否则维持 Stage-0 NoOp 默认值
             pipeline_kwargs.update(
                 unary_kfa=kfa,
                 projector=projector,
                 # 逐帧特征的时间归一化用本序列的全局最大帧号。
+                # 用默认参数 _tm=t_max 把当前循环变量的值"冻结"进闭包——
+                # 直接引用外层 t_max 会有经典的 Python 闭包晚绑定问题
+                # (循环结束后所有 lambda 都会看到同一个、最后一次迭代的 t_max)。
                 frame_feature_fn=lambda traj, _tm=t_max: geometric_frame_features(
                     traj, t_max=_tm
                 ),

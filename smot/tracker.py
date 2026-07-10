@@ -19,16 +19,18 @@ class VideoHandle:
     """
 
     def __init__(self, path: str, num_frames: int, fps: float = 1.0):
-        self.path = path
-        self.num_frames = num_frames
-        self.fps = fps
+        self.path = path  # 视频文件路径或序列目录
+        self.num_frames = num_frames  # 总帧数
+        self.fps = fps  # 帧率(默认 1.0,占位实现不依赖真实时间轴)
 
 
 @runtime_checkable
 class Tracker(Protocol):
     """冻结,不 finetune。"""
 
-    def track(self, video: VideoHandle) -> list[Trajectory]: ...
+    def track(self, video: VideoHandle) -> list[Trajectory]:
+        """对整段视频跑检测+跟踪,返回全部目标的轨迹列表。"""
+        ...
 
 
 class StubTracker:
@@ -38,7 +40,8 @@ class StubTracker:
     """
 
     def __init__(self, canned_trajectories: Optional[list[Trajectory]] = None):
-        self._canned_trajectories = canned_trajectories or []
+        self._canned_trajectories = canned_trajectories or []  # 预先准备好的轨迹
 
     def track(self, video: VideoHandle) -> list[Trajectory]:
+        # video 参数被忽略:StubTracker 不看视频内容,只回放构造时传入的轨迹。
         return list(self._canned_trajectories)

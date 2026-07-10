@@ -24,8 +24,13 @@ def _embed(
     是 Stage-1a 训练前的显式待办)。
     """
     type_index = float(FACT_TYPE_ORDER.index(fact_type))
-    scale = max(t_scale, 1.0)
-    return (type_index, float(norm_value), t_span[0] / scale, t_span[1] / scale)
+    scale = max(t_scale, 1.0)  # 防止 t_scale 为 0(极短/单帧视频)时除零
+    return (
+        type_index,  # 事实类型在 FACT_TYPE_ORDER 里的下标
+        float(norm_value),  # 该事实的"强度"标量(不同类型含义不同,见各调用处)
+        t_span[0] / scale,  # 起始帧号归一化到 [0, 1]
+        t_span[1] / scale,  # 结束帧号归一化到 [0, 1]
+    )
 
 
 class MotionFactExtractor:
@@ -176,6 +181,7 @@ class MotionFactExtractor:
         facts: list[Fact] = []
         for traj in trajectories:
             facts.extend(self.extract_instance_facts(traj, t_max=t_max))
+        # 双重循环 b 从 a+1 开始:只枚举无序对 (a, b),既不重复也不算 (i, i)。
         for a in range(len(trajectories)):
             for b in range(a + 1, len(trajectories)):
                 facts.extend(

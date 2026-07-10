@@ -81,6 +81,7 @@ def main() -> int:
         )
 
     golds = build_gold_payloads(sequences)
+    # preds 与 golds 按序列列表同一顺序构造,evaluate() 按下标逐一配对。
     metrics = evaluate(preds, golds, synonym_map=BENSMOT_SYNONYM_MAP)
 
     os.makedirs(args.out_dir, exist_ok=True)

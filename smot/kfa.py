@@ -1,5 +1,10 @@
 """Unary KFA / Pairwise KFA:Protocol 定义 + Stage-0 no-op 占位实现。
 
+KFA = Key Frame Attention(关键帧注意力):从一个目标(unary)或一对
+目标(pairwise)的全部观测帧里,挑出最能代表其行为/交互的少数几帧
+喂给 MLLM——因为把所有帧都喂进去既昂贵又会稀释注意力,所以需要一个
+"选帧"的模块,而且这个选择本身可以是可学习的(打分 + top-k)。
+
 对应 §4/§6:slot + projector 从 Stage-1a(unary)/ Stage-1b(pairwise)
 开始才是可学习的,采用 soft+hard 双读出(hard 的 top-k 离散选帧搭 soft
 读出的梯度便车)。Stage-0 阶段还没有真正学习的 slot,下面这两个 no-op
@@ -33,8 +38,8 @@ class KeyFrameSelection:
     soft token。
     """
 
-    key_frames: tuple[int, ...]
-    soft_token: tuple[float, ...] | None
+    key_frames: tuple[int, ...]  # hard 读出:实际渲染送入 MLLM 的帧号(离散选择)
+    soft_token: tuple[float, ...] | None  # soft 读出:梯度回传通道;不学习时为 None
 
 
 def _evenly_spaced(ts: Sequence[int], top_k: int) -> tuple[int, ...]:
@@ -50,6 +55,8 @@ def _evenly_spaced(ts: Sequence[int], top_k: int) -> tuple[int, ...]:
     # 在 [0, len(ts)-1] 的下标范围内等间隔取 top_k 个下标
     # (用 set 去重是为了防止 round() 后出现重复下标),
     # 从而得到近似均匀分布在整个时段上的关键帧。
+    # step 是相邻抽样点之间的平均下标间隔;top_k==1 时特判为 0,
+    # 表示只取一个点(下面 i*step 恒为 0,即取第一个下标)。
     step = (len(ts) - 1) / (top_k - 1) if top_k > 1 else 0
     indices = sorted({round(i * step) for i in range(top_k)})
     return tuple(ts[i] for i in indices)

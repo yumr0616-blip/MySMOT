@@ -11,5 +11,7 @@
     qwen_adapter.py    冻结 Qwen3.5 的 MLLMAdapter 实现 + soft token 注入
     unary_kfa.py       可学习 Unary KFA(Stage-1a)
     projector.py       可学习 Projector(Stage-1a)
+    checkpoint.py      Stage-1a checkpoint 的保存/加载(权重+构造配置+统计量)
+    training.py        Stage-1a 训练循环(教师强制,见模块内 docstring)
     gradient_check.py  Stage-1a 验收门禁 #1(python -m smot.ml.gradient_check)
 """

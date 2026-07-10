@@ -33,7 +33,7 @@ def build_video_prompt(involved_ids: tuple[int, ...], transcript_text: str) -> s
     """构造"概括整段视频"的 prompt,把所有涉及到的 track_id 列在
     方括号里。
     """
-    ids_text = ", ".join(str(i) for i in involved_ids)
+    ids_text = ", ".join(str(i) for i in involved_ids)  # 如 "1, 2, 3"
     return (
         f"Summarize the video involving track ids [{ids_text}] based on the "
         f"following motion facts: {transcript_text}"

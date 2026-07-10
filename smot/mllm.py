@@ -39,18 +39,20 @@ class MLLMRequest:
     """
 
     prompt_type: str  # "instance" | "interaction" | "video"
-    transcript_text: str
-    frame_refs: tuple[int, ...]
-    soft_tokens: tuple[tuple[float, ...], ...] = field(default_factory=tuple)
-    video_path: str = ""
-    frame_boxes: FrameBoxes = field(default_factory=tuple)
+    transcript_text: str  # prompts.py 构造出的完整任务 prompt(含 transcript)
+    frame_refs: tuple[int, ...]  # KFA 选中的关键帧号(证据帧)
+    soft_tokens: tuple[tuple[float, ...], ...] = field(default_factory=tuple)  # projector 输出
+    video_path: str = ""  # 帧图像目录或视频文件路径,供真实适配器渲染
+    frame_boxes: FrameBoxes = field(default_factory=tuple)  # 每个关键帧上各 track 的框
 
 
 @runtime_checkable
 class MLLMAdapter(Protocol):
     """冻结。"""
 
-    def generate(self, request: MLLMRequest) -> str: ...
+    def generate(self, request: MLLMRequest) -> str:
+        """对一次请求做前向生成,返回纯文本回复。"""
+        ...
 
 
 class MockMLLMAdapter:
