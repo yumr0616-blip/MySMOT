@@ -158,6 +158,10 @@ python -m smot.datasets.bensmot stats <BenSMOT>/train -o fact_stats.json
 .venv/Scripts/python examples/run_bensmot_real.py <BenSMOT>/test --limit 8 \
     --checkpoint out/stage1b/stage1b.pt
 
+# 长跑防杀:两个入口都支持 --resume(训练精确接续——样本顺序/RNG/优化器
+# 全恢复,与不中断一次跑逐位一致;评测逐序列增量写 pred.jsonl,续跑跳过
+# 已完成段)。训练还支持 --max-steps N 分段跑。
+
 # Evaluate any pred/gold payload pair (SS7: tiered interaction F1
 # strict / synonym-merged / coarse, direction accuracy, instance coverage,
 # cost aggregation). Both files hold a PipelineResult JSON or a list of them.

@@ -52,6 +52,12 @@ def main() -> int:
         help="训练好的 checkpoint(1a/1b 格式自动判别,注入对应可学习组件)",
     )
     parser.add_argument("--skip-errors", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="从 <out-dir>/pred.jsonl 续跑:跳过已完成序列(须与上次同一"
+             "配置/checkpoint,脚本不校验)",
+    )
     args = parser.parse_args()
 
     sequences, errors = load_split(
@@ -88,8 +94,31 @@ def main() -> int:
             f" steps={loaded.extra.get('steps')}", file=sys.stderr,
         )
 
-    preds: list[dict] = []
+    # ---- 增量落盘:逐序列一行 JSON(行缓冲),被杀最多丢当前这一段;
+    # --resume 时读回已完成的序列直接跳过(P-eng,防随机进程误杀)。----
+    os.makedirs(args.out_dir, exist_ok=True)
+    jsonl_path = os.path.join(args.out_dir, "pred.jsonl")
+    done: dict[str, dict] = {}
+    if args.resume and os.path.exists(jsonl_path):
+        with open(jsonl_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # 被杀时可能留下半行,静默丢弃(该段会重跑)
+                done[payload["sequence"]] = payload
+        if done:
+            print(f"[续跑] 已完成 {len(done)} 段,跳过", file=sys.stderr)
+
+    jsonl_file = open(  # noqa: SIM115 - 生命周期跨整个循环,结束处显式关闭
+        jsonl_path, "a" if args.resume else "w", encoding="utf-8", buffering=1
+    )
     for seq in sequences:
+        if seq.name in done:
+            continue
         t_max = max(traj.present[1] for traj in seq.trajectories)
         trajectories = list(seq.trajectories)
         pipeline_kwargs: dict = {
@@ -130,7 +159,8 @@ def main() -> int:
         result = pipeline.run(sequence_to_video_handle(seq))
         payload = result.to_json_dict()
         payload["sequence"] = seq.name
-        preds.append(payload)
+        done[seq.name] = payload
+        jsonl_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
         print(
             f"[完成] {seq.name}: cost={result.cost.to_json_dict()}", file=sys.stderr
         )
@@ -145,10 +175,13 @@ def main() -> int:
             )
         print(f"    video: {result.video.summary}", file=sys.stderr)
 
+    jsonl_file.close()
+    # 按 sequences 的规范顺序聚合(而不是 jsonl 的写入顺序):续跑与
+    # 一次跑完产出的 pred.json 逐字节一致。
+    preds = [done[seq.name] for seq in sequences]
     golds = build_gold_payloads(sequences)
     metrics = evaluate(preds, golds, synonym_map=BENSMOT_SYNONYM_MAP)
 
-    os.makedirs(args.out_dir, exist_ok=True)
     for filename, payload in (
         ("pred.json", preds),
         ("gold.json", golds),

@@ -23,11 +23,18 @@
 
 产出(--out-dir):
     stage1b.pt        checkpoint(四模块权重 + 构造配置 + fact 统计量)
+    train_state.pt    续训状态(optimizer + epoch/步游标 + RNG),与
+                      stage1b.pt 同步落盘
     loss_log.jsonl    每步一行 {"step", "epoch", "task", "loss"}
+
+断点续训(--resume):从 train_state.pt 精确接续——本 epoch 的样本
+顺序、epoch 内位置、python/torch RNG 状态全部恢复,续跑与一次跑完
+的样本序列完全相同。跑长任务(500 段以上)必须开 --resume 心智:
+本机会随机杀后台进程(实测),save-every 决定最大损失步数。
 
 用法:
     python -m smot.ml.training <BenSMOT根目录> --out-dir out/stage1b \
-        [--limit N] [--epochs 2] [--lr 1e-4] [--max-frames 2] [...]
+        [--limit N] [--epochs 2] [--lr 1e-4] [--resume] [--max-steps N] [...]
 """
 from __future__ import annotations
 
@@ -411,18 +418,47 @@ def train(args) -> dict:
     embedding = model.get_input_embeddings()
     embed_rms = float(embedding.weight.detach().float().pow(2).mean().sqrt())
 
-    unary_kfa = LearnableUnaryKFA().to(device)
-    pairwise_kfa = LearnablePairwiseKFA().to(device)
-    fact_selector = LearnableFactSelector().to(device)
-    projector = MLPProjector(
-        # [fact | unary | pairwise] 槽位布局(与 Pipeline._compose_pooled
-        # 的推理侧组装同一契约,tests/test_ml_modules.py 锁住两侧一致)。
-        in_dim=fact_selector.out_dim + unary_kfa.out_dim + pairwise_kfa.out_dim,
-        d_llm=embedding.embedding_dim,
-        n_tokens=args.n_tokens,
-        output_gain=embed_rms,  # 见 MLPProjector 模块 docstring:对齐冻结 LM 词嵌入尺度
-    ).to(device)
-    modules = _Modules(unary_kfa, pairwise_kfa, fact_selector, projector)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = out_dir / "stage1b.pt"
+    state_path = out_dir / "train_state.pt"
+
+    # ---- 断点续训:stage1b.pt(模块权重)+ train_state.pt(优化器/游标/RNG)
+    # 成对恢复;两者以 steps 互校,防止只写了一半就被杀导致的错配。----
+    resume_state = None
+    if args.resume and ckpt_path.exists() and state_path.exists():
+        from smot.ml.checkpoint import load_checkpoint
+
+        loaded = load_checkpoint(ckpt_path, device=device)
+        resume_state = torch.load(str(state_path), map_location=device, weights_only=True)
+        if loaded.extra.get("steps") != resume_state["steps"]:
+            raise SystemExit(
+                f"续训状态不一致:stage1b.pt steps={loaded.extra.get('steps')} "
+                f"!= train_state.pt steps={resume_state['steps']}(两文件写入间被杀?"
+                f"删除 train_state.pt 从最近 checkpoint 的权重重新开训,或整体重跑)"
+            )
+        if loaded.stage != "1b" or loaded.pairwise_kfa is None:
+            raise SystemExit("--resume 只支持 Stage-1b 格式 checkpoint")
+        modules = _Modules(
+            loaded.unary_kfa, loaded.pairwise_kfa, loaded.fact_selector, loaded.projector
+        )
+        print(
+            f"[续训] 从 step {resume_state['steps']}(epoch {resume_state['epoch']},"
+            f" epoch 内第 {resume_state['index_in_epoch']} 条)继续", file=sys.stderr,
+        )
+    else:
+        unary_kfa = LearnableUnaryKFA().to(device)
+        pairwise_kfa = LearnablePairwiseKFA().to(device)
+        fact_selector = LearnableFactSelector().to(device)
+        projector = MLPProjector(
+            # [fact | unary | pairwise] 槽位布局(与 Pipeline._compose_pooled
+            # 的推理侧组装同一契约,tests/test_ml_modules.py 锁住两侧一致)。
+            in_dim=fact_selector.out_dim + unary_kfa.out_dim + pairwise_kfa.out_dim,
+            d_llm=embedding.embedding_dim,
+            n_tokens=args.n_tokens,
+            output_gain=embed_rms,  # 见 MLPProjector 模块 docstring:对齐冻结 LM 词嵌入尺度
+        ).to(device)
+        modules = _Modules(unary_kfa, pairwise_kfa, fact_selector, projector)
     for module in modules.all():
         module.train()
     trainable = list(
@@ -436,16 +472,55 @@ def train(args) -> dict:
         file=sys.stderr,
     )
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "loss_log.jsonl"
     renderer = _FrameRenderer(max_side=args.image_max_side)
 
     step = 0
     epoch_means: list[float] = []
+    start_epoch, start_index = 1, 0
+    resume_order = resume_losses = None
+    if resume_state is not None:
+        optimizer.load_state_dict(resume_state["optimizer_state"])
+        step = resume_state["steps"]
+        epoch_means = list(resume_state["epoch_means"])
+        start_epoch = resume_state["epoch"]
+        start_index = resume_state["index_in_epoch"]
+        resume_order = list(resume_state["order"])
+        resume_losses = list(resume_state["losses"])
+        # RNG 三件套全部恢复:python rng 决定后续 epoch 的 shuffle 顺序,
+        # torch/cuda rng 保证任何隐式随机行为与不中断的一次跑一致。
+        py_state = resume_state["py_rng"]
+        rng.setstate((py_state[0], tuple(py_state[1]), py_state[2]))
+        torch.set_rng_state(resume_state["torch_rng"].cpu().to(torch.uint8))
+        if device.startswith("cuda") and resume_state.get("cuda_rng") is not None:
+            torch.cuda.set_rng_state(resume_state["cuda_rng"].cpu().to(torch.uint8))
+        if start_index >= len(resume_order):
+            # 存档恰好落在 epoch 边界:该 epoch 已闭合(均值已入 epoch_means),
+            # 从下一个 epoch 全新开始。
+            start_epoch += 1
+            resume_order = resume_losses = None
+        # 截掉 loss log 里超过续训点的行(被杀可能发生在"写日志之后、
+        # 存档之前",直接续写会产生重复 step)。
+        if log_path.exists():
+            kept = []
+            with open(log_path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        if json.loads(line)["step"] <= step:
+                            kept.append(line)
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.writelines(kept)
     empty_cache_every = 20  # 周期清空 CUDA 缓存分配器,缓解变长样本的碎片化
 
-    def save(epoch: int, stamp: bool = False) -> None:
+    def save(
+        epoch: int,
+        index_in_epoch: int,
+        order: list[int],
+        losses: list[float],
+        stamp: bool = False,
+    ) -> None:
         extra = {
             "fact_stats": fact_stats,
             "epochs": epoch,
@@ -456,7 +531,7 @@ def train(args) -> dict:
         # 周期性存档一律覆盖 stage1b.pt;epoch 末尾(stamp=True)额外留
         # 一份带 epoch 戳的副本——不同训练预算(1 epoch vs 2 epochs)的
         # checkpoint 都能拿去评测对比,不会被后续 epoch 覆盖。
-        targets = [out_dir / "stage1b.pt"]
+        targets = [ckpt_path]
         if stamp:
             targets.append(out_dir / f"stage1b_epoch{epoch}.pt")
         for target in targets:
@@ -468,16 +543,47 @@ def train(args) -> dict:
                 modules.projector,
                 extra=extra,
             )
+        # 续训状态与 checkpoint 成对写入(steps 互校见 --resume 加载处);
+        # index_in_epoch 是"已完成条数",续训从 order[index_in_epoch] 开始。
+        torch.save(
+            {
+                "steps": step,
+                "epoch": epoch,
+                "index_in_epoch": index_in_epoch,
+                "order": list(order),
+                "losses": list(losses),
+                "epoch_means": list(epoch_means),
+                "optimizer_state": optimizer.state_dict(),
+                "py_rng": rng.getstate(),
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": (
+                    torch.cuda.get_rng_state() if device.startswith("cuda") else None
+                ),
+            },
+            str(state_path),
+        )
 
     # buffering=1(行缓冲):每条 loss 记录立刻落盘,外部监控/断点续查
     # 才能看到真实进度(块缓冲曾让日志停在 flush 点,掩盖了停摆位置)。
-    with open(log_path, "w", encoding="utf-8", buffering=1) as log_file:
-        for epoch in range(1, args.epochs + 1):
-            order = list(range(len(examples)))
-            rng.shuffle(order)
-            losses: list[float] = []
-            for index in order:
-                example = examples[index]
+    # 续训时以追加模式打开(超过续训点的行已在上面截掉)。
+    with open(
+        log_path, "a" if resume_state is not None else "w",
+        encoding="utf-8", buffering=1,
+    ) as log_file:
+        for epoch in range(start_epoch, args.epochs + 1):
+            if resume_order is not None:
+                # 续训的第一个 epoch:沿用存档里的样本顺序与已积累的
+                # losses,从 epoch 内游标处接着跑;之后的 epoch 走正常路径
+                # (rng 状态已恢复,shuffle 结果与不中断的一次跑相同)。
+                order, losses, begin = resume_order, resume_losses, start_index
+                resume_order = resume_losses = None
+            else:
+                order = list(range(len(examples)))
+                rng.shuffle(order)
+                losses = []
+                begin = 0
+            for pos in range(begin, len(order)):
+                example = examples[order[pos]]
                 loss = example_loss(
                     model, processor, modules, example, renderer,
                     args.top_k_frames, args.top_k_pair_frames, args.fact_top_k,
@@ -514,12 +620,23 @@ def train(args) -> dict:
                 # 周期性存档:长跑被环境超时/断电杀掉时,最多损失
                 # save_every 步的进度,而不是整个未完成的 epoch。
                 if args.save_every and step % args.save_every == 0:
-                    save(epoch)
+                    save(epoch, pos + 1, order, losses)
+                if args.max_steps and step >= args.max_steps:
+                    save(epoch, pos + 1, order, losses)
+                    print(
+                        f"[中断] 已到 --max-steps {args.max_steps},状态已存,"
+                        f"可用 --resume 继续", file=sys.stderr,
+                    )
+                    return {
+                        "epoch_mean_losses": epoch_means,
+                        "steps": step,
+                        "interrupted": True,
+                    }
             mean_loss = sum(losses) / len(losses)
             epoch_means.append(mean_loss)
             print(f"[epoch {epoch}] mean loss = {mean_loss:.4f}",
                   file=sys.stderr, flush=True)
-            save(epoch, stamp=True)
+            save(epoch, len(order), order, losses, stamp=True)
 
     print(
         f"[完成] checkpoint -> {out_dir / 'stage1b.pt'};"
@@ -558,6 +675,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--save-every", type=int, default=100,
         help="每 N 步周期性保存 checkpoint(0 关闭,只在 epoch 末保存)",
     )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="从 <out-dir>/train_state.pt 精确续训(样本顺序/RNG 完全恢复);"
+             "状态文件不存在时等同全新开训",
+    )
+    parser.add_argument(
+        "--max-steps", type=int, default=0,
+        help="跑满 N 步后保存状态并退出(0 关闭;配合 --resume 用于分段跑/测试)",
+    )
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--quantize-4bit", action="store_true")
@@ -567,6 +693,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     report = train(args)
+    if report.get("interrupted"):
+        print(f"分段跑:已完成 {report['steps']} 步,--resume 可继续")
+        return 0
     means = report["epoch_mean_losses"]
     if len(means) >= 2 and means[-1] < means[0]:
         print(f"loss 下降: {means[0]:.4f} -> {means[-1]:.4f}")
