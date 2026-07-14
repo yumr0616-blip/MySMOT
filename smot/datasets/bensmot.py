@@ -107,6 +107,19 @@ BENSMOT_SYNONYM_MAP: dict[str, str] = {
     "hear": "listen",
     "grab": "hold",
     "grip": "hold",
+    # ---- P1 扩充(2026-07-14):由 100 段大评测的"未匹配 pred×gold
+    # 共现统计"挖掘 + 人工审核,方法与证据量见 out/report/next_steps.md。
+    # 表面归一化(模型输出风格差异,非语义差异):
+    "look at": "look",  # 共现 17 次;"look at" 在 pred 词表出现 35 次
+    "smile at": "smile",
+    # 语义同义:
+    "pet": "caress",  # 共现 8 次(抚摸宠物场景)
+    "seize": "hold",  # 共现 6 次;与既有 grab/grip -> hold 同簇
+    "return": "give",  # return.v.06 = 归还,语义是"给回去"(递还现金实证)
+    "hash out": "talk",  # hash_out.v.01 的 WordNet 释义即 "talk over in detail"
+    # 标注笔误(与上面 recieve 同类):
+    "reveive": "accept",
+    "smile.0.01": "smile",  # 坏 synset 名(应为 smile.v.01),按词干归一
 }
 
 
