@@ -7,16 +7,30 @@
 """
 from __future__ import annotations
 
+from typing import Optional
+
 from smot._geometry import centroid, dist
 from smot.types import Fact, FactType, Trajectory, FACT_TYPE_ORDER
 
 
-def _embed(fact_type: FactType, norm_value: float, t_span: tuple[int, int]) -> tuple[float, ...]:
+def _embed(
+    fact_type: FactType, norm_value: float, t_span: tuple[int, int], t_scale: float
+) -> tuple[float, ...]:
     """按 Fact.embed 的固定约定构造一个 4 维向量,供未来的 Fact Selector
-    打分用。type_index 取该事实类型在 FACT_TYPE_ORDER 中的下标。
+    打分用。type_index 取该事实类型在 FACT_TYPE_ORDER 中的下标;
+    t_span 两个分量除以 t_scale(视频最大帧号)归一化到 [0, 1],
+    否则长视频里的原始帧号数值会淹没前两个维度的打分信号。
+    norm_value 暂时仍是原始数值(跨数据集归一化需要数据集统计量,
+    是 Stage-1a 训练前的显式待办)。
     """
     type_index = float(FACT_TYPE_ORDER.index(fact_type))
-    return (type_index, float(norm_value), float(t_span[0]), float(t_span[1]))
+    scale = max(t_scale, 1.0)  # 防止 t_scale 为 0(极短/单帧视频)时除零
+    return (
+        type_index,  # 事实类型在 FACT_TYPE_ORDER 里的下标
+        float(norm_value),  # 该事实的"强度"标量(不同类型含义不同,见各调用处)
+        t_span[0] / scale,  # 起始帧号归一化到 [0, 1]
+        t_span[1] / scale,  # 结束帧号归一化到 [0, 1]
+    )
 
 
 class MotionFactExtractor:
@@ -24,15 +38,16 @@ class MotionFactExtractor:
     和两两 pair 事实(proximity/approach)。
     """
 
-    def __init__(self, speed_window: int = 1, proximity_threshold: float = 50.0):
-        # speed_window / proximity_threshold 目前只是预留参数,当前实现
-        # 尚未使用滑动窗口平滑速度、也没有用阈值过滤 proximity,后续如需
-        # 更精细的速度平滑或近距离筛选可以在这里接入。
-        self.speed_window = speed_window
-        self.proximity_threshold = proximity_threshold
+    def extract_instance_facts(self, traj: Trajectory, t_max: Optional[int] = None) -> list[Fact]:
+        """抽取单个轨迹自身的三类事实:出现时段、净位移、平均速度。
 
-    def extract_instance_facts(self, traj: Trajectory) -> list[Fact]:
-        """抽取单个轨迹自身的三类事实:出现时段、净位移、平均速度。"""
+        t_max 是整段视频的最大帧号,用于 embed 的时间归一化;单独调用
+        (不经过 extract())时可以不传,此时退化为用该轨迹自身的最大
+        帧号做归一化。
+        """
+        if t_max is None:
+            t_max = traj.per_frame[-1].t if traj.per_frame else traj.present[1]
+        t_scale = float(t_max)
         facts: list[Fact] = []
         t_in, t_out = traj.present
         scope = f"instance:{traj.track_id}"
@@ -44,7 +59,7 @@ class MotionFactExtractor:
                 scope=scope,
                 value=(t_in, t_out),
                 t_span=(t_in, t_out),
-                embed=_embed(FactType.PRESENCE, t_out - t_in, (t_in, t_out)),
+                embed=_embed(FactType.PRESENCE, t_out - t_in, (t_in, t_out), t_scale),
             )
         )
 
@@ -63,7 +78,7 @@ class MotionFactExtractor:
                 scope=scope,
                 value=(dx, dy),
                 t_span=(t_in, t_out),
-                embed=_embed(FactType.NET_MOTION, dist((0, 0), (dx, dy)), (t_in, t_out)),
+                embed=_embed(FactType.NET_MOTION, dist((0, 0), (dx, dy)), (t_in, t_out), t_scale),
             )
         )
 
@@ -73,7 +88,8 @@ class MotionFactExtractor:
         for a, b in zip(traj.per_frame, traj.per_frame[1:]):
             dt = b.t - a.t
             if dt <= 0:
-                # 帧号异常(重复或倒序)时跳过这一段,避免除零/负数干扰。
+                # 防御性守卫:Trajectory 构造时已校验帧号严格递增,
+                # 正常情况下不会触发;保留是为了避免除零。
                 continue
             speeds.append(dist(centroid(a.box), centroid(b.box)) / dt)
         mean_speed = sum(speeds) / len(speeds) if speeds else 0.0
@@ -83,15 +99,24 @@ class MotionFactExtractor:
                 scope=scope,
                 value=mean_speed,
                 t_span=(t_in, t_out),
-                embed=_embed(FactType.SPEED, mean_speed, (t_in, t_out)),
+                embed=_embed(FactType.SPEED, mean_speed, (t_in, t_out), t_scale),
             )
         )
         return facts
 
-    def extract_pair_facts(self, traj_i: Trajectory, traj_j: Trajectory) -> list[Fact]:
+    def extract_pair_facts(
+        self, traj_i: Trajectory, traj_j: Trajectory, t_max: Optional[int] = None
+    ) -> list[Fact]:
         """抽取两个轨迹之间的 pair 事实:接近程度(proximity)和
         靠近/远离趋势(approach)。只在两者都出现的公共帧范围内计算。
+        t_max 含义同 extract_instance_facts,不传时用两条轨迹的最大帧号。
         """
+        if t_max is None:
+            t_max = max(
+                (fp.t for traj in (traj_i, traj_j) for fp in traj.per_frame),
+                default=max(traj_i.present[1], traj_j.present[1]),
+            )
+        t_scale = float(t_max)
         facts: list[Fact] = []
         # 两个轨迹各自的观测帧号取交集,只有双方都出现的帧才能算相对距离。
         common_ts = sorted(
@@ -101,7 +126,10 @@ class MotionFactExtractor:
             # 两者从未同时出现过(比如时间上完全错开),无法算 pair 事实。
             return facts
 
-        scope = f"pair:{traj_i.track_id},{traj_j.track_id}"
+        # scope 键统一用排序后的 id,与调用方传入两条轨迹的先后顺序解耦
+        # (pair 事实本身是对称的;方向语义不在 scope 里表达)。
+        lo, hi = sorted((traj_i.track_id, traj_j.track_id))
+        scope = f"pair:{lo},{hi}"
         t_span = (common_ts[0], common_ts[-1])
         distances = [
             dist(centroid(traj_i.frame_at(t).box), centroid(traj_j.frame_at(t).box))
@@ -117,7 +145,7 @@ class MotionFactExtractor:
                 scope=scope,
                 value={"min": min_dist, "mean": mean_dist},
                 t_span=t_span,
-                embed=_embed(FactType.PROXIMITY, min_dist, t_span),
+                embed=_embed(FactType.PROXIMITY, min_dist, t_span, t_scale),
             )
         )
 
@@ -136,7 +164,7 @@ class MotionFactExtractor:
                 scope=scope,
                 value=approach_value,
                 t_span=t_span,
-                embed=_embed(FactType.APPROACH, distances[0] - distances[-1], t_span),
+                embed=_embed(FactType.APPROACH, distances[0] - distances[-1], t_span, t_scale),
             )
         )
         return facts
@@ -144,12 +172,19 @@ class MotionFactExtractor:
     def extract(self, trajectories: list[Trajectory]) -> list[Fact]:
         """对外的总入口:先对每个轨迹单独抽取实例事实,再对所有轨迹两两
         组合抽取 pair 事实(共 C(n,2) 对,轨迹数很大时需注意成本,当前
-        脚手架规模下可以接受)。
+        脚手架规模下可以接受)。embed 的时间归一化统一用全体轨迹的最大
+        帧号,保证同一段视频里所有事实的时间维度在同一个尺度上可比。
         """
+        t_max = max(
+            (fp.t for traj in trajectories for fp in traj.per_frame), default=0
+        )
         facts: list[Fact] = []
         for traj in trajectories:
-            facts.extend(self.extract_instance_facts(traj))
+            facts.extend(self.extract_instance_facts(traj, t_max=t_max))
+        # 双重循环 b 从 a+1 开始:只枚举无序对 (a, b),既不重复也不算 (i, i)。
         for a in range(len(trajectories)):
             for b in range(a + 1, len(trajectories)):
-                facts.extend(self.extract_pair_facts(trajectories[a], trajectories[b]))
+                facts.extend(
+                    self.extract_pair_facts(trajectories[a], trajectories[b], t_max=t_max)
+                )
         return facts

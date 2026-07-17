@@ -13,28 +13,46 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional, Protocol, runtime_checkable
 
+from smot.types import Box
+
 _TRACK_ID_RE = re.compile(r"track_id=(\d+)")
 _SUBJECT_ID_RE = re.compile(r"subject_id=(\d+)")
 _OBJECT_ID_RE = re.compile(r"object_id=(\d+)")
+
+# 与 MLLMRequest.frame_refs 对齐的框标注:每项是 (帧号, ((track_id, 框), ...))。
+# 真实多模态适配器用它在关键帧上画框做视觉 grounding("track_id=1 就是
+# 红框里那个人")——没有这一步,模型无法把 prompt 里的 id 对应到画面里
+# 的具体目标,instance 描述的"可归因"就落不了地。
+FrameBoxes = tuple[tuple[int, tuple[tuple[int, Box], ...]], ...]
 
 
 @dataclass(frozen=True)
 class MLLMRequest:
     """发给 MLLM 的一次请求:任务类型 + transcript 文本(prompts.py
-    构造出的完整 prompt)+ 关键帧引用 + (Stage-0 恒为空的)soft token。
+    构造出的完整 prompt)+ 关键帧引用 + soft token(默认空,由 Pipeline
+    把 projector 的输出接进来;Stage-0 的 NoOpProjector 不产 token,
+    真实 projector 的 token 会原样到达这里)。
+
+    video_path / frame_boxes 是给真实多模态适配器渲染帧用的补充上下文
+    (帧图像目录或视频文件的路径 + 每个关键帧上各 track 的框),由
+    Pipeline 填入;Stage-0 的 Mock 不消费它们,默认空值保持旧行为。
     """
 
     prompt_type: str  # "instance" | "interaction" | "video"
-    transcript_text: str
-    frame_refs: tuple[int, ...]
-    soft_tokens: tuple[tuple[float, ...], ...] = field(default_factory=tuple)
+    transcript_text: str  # prompts.py 构造出的完整任务 prompt(含 transcript)
+    frame_refs: tuple[int, ...]  # KFA 选中的关键帧号(证据帧)
+    soft_tokens: tuple[tuple[float, ...], ...] = field(default_factory=tuple)  # projector 输出
+    video_path: str = ""  # 帧图像目录或视频文件路径,供真实适配器渲染
+    frame_boxes: FrameBoxes = field(default_factory=tuple)  # 每个关键帧上各 track 的框
 
 
 @runtime_checkable
 class MLLMAdapter(Protocol):
     """冻结。"""
 
-    def generate(self, request: MLLMRequest) -> str: ...
+    def generate(self, request: MLLMRequest) -> str:
+        """对一次请求做前向生成,返回纯文本回复。"""
+        ...
 
 
 class MockMLLMAdapter:

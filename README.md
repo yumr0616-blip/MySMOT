@@ -24,10 +24,12 @@ video
 ```
 
 Frozen (never trained): tracker, MLLM body, MLLM vision tower.
-Learnable (Stage-1a/1b, not yet implemented here): KFA semantic slots, the
-Fact Selector's slot, and the KFA/Fact -> MLLM projector(s).
-Deterministic (implemented for real in this scaffold): motion fact geometric
-extraction, event candidate filtering, output assembly.
+Learnable (implemented in `smot/ml/`): Stage-1a's unary KFA slot and the
+KFA/Fact -> MLLM projector, plus Stage-1b's pairwise KFA and Fact
+Selector slots — four small modules (~2.3M params total) trained jointly
+against the frozen MLLM.
+Deterministic (implemented for real): motion fact geometric extraction,
+event candidate filtering, output assembly.
 
 ## Modules
 
@@ -36,49 +38,133 @@ extraction, event candidate filtering, output assembly.
 | Frozen Tracker | `smot/tracker.py` | Frozen (`StubTracker` stands in for a real detector+SAM2 tracker) |
 | Motion Fact Extractor | `smot/motion_facts.py` | Deterministic (real) |
 | Event Candidate Filter | `smot/event_filter.py` | Heuristic, not learned (real) |
-| Fact Selector | `smot/fact_selector.py` | Slot learnable in Stage-1+; `DeterministicFactSelector` is the Stage-0 default |
-| Unary KFA | `smot/kfa.py` | Learnable in Stage-1a; `NoOpUnaryKFA` is the Stage-0 default |
-| Pairwise KFA | `smot/kfa.py` | Learnable in Stage-1b; `NoOpPairwiseKFA` is the Stage-0 default |
+| Pair Feature builder | `smot/pair_features.py` | Deterministic (real) — per-frame relative geometry fed into the Pairwise KFA |
+| Fact Selector | `smot/fact_selector.py` | Slot learnable from Stage-1b (`smot/ml/fact_selector.py`); `DeterministicFactSelector` is the Stage-0 default |
+| Unary KFA | `smot/kfa.py` | Learnable from Stage-1a; `NoOpUnaryKFA` is the Stage-0 default |
+| Pairwise KFA | `smot/kfa.py` | Learnable from Stage-1b; `NoOpPairwiseKFA` is the Stage-0 default |
 | Projector | `smot/projector.py` | Learnable in Stage-1a/1b; `NoOpProjector` is the Stage-0 default |
 | Frozen MLLM | `smot/mllm.py` | Frozen (`MockMLLMAdapter` stands in for a real MLLM) |
-| Output Assembler | `smot/output_assembler.py` | Deterministic (real) |
+| Output Assembler | `smot/output_assembler.py` | Deterministic (real); structured-JSON-first interaction parsing with free-text fallback |
 | Pipeline orchestrator | `smot/pipeline.py` | Wires all of the above |
+| Frame features | `smot/frame_features.py` | Deterministic per-frame geometry/motion features — the learnable unary KFA's scoring input |
+| BenSMOT converter | `smot/datasets/bensmot.py` | stdlib-only loader: MOT gt.txt -> `Trajectory`, captions/graphml -> gold eval payloads, fact statistics; `probe` CLI for format verification |
+| Real MLLM adapter | `smot/ml/qwen_adapter.py` | Frozen Qwen3.5 (`AutoModelForMultimodalLM`), key-frame images + box grounding + soft-token injection via embedding hook |
+| Learnable Unary KFA | `smot/ml/unary_kfa.py` | Stage-1a: soft attention readout + hard top-k riding the soft gradient |
+| Learnable Pairwise KFA | `smot/ml/pairwise_kfa.py` | Stage-1b: same soft+hard mechanics over per-frame relative-geometry vectors (`pair_feature_vectors`) — hard top-k picks interaction evidence frames |
+| Learnable Fact Selector | `smot/ml/fact_selector.py` | Stage-1b: scores facts in scope; soft attention readout replaces mean-pooling as the projector's fact slot, hard top-k renders the transcript |
+| Learnable Projector | `smot/ml/projector.py` | Stage-1a/1b: residual MLP -> m soft tokens, output scale matched to the LM embedding RMS; input is the `[fact | unary | pairwise]` slot layout |
+| Gradient gate | `smot/ml/gradient_check.py` | Acceptance gate #1: non-zero grads land exactly on {unary KFA, pairwise KFA, fact selector, projector} |
 
 Core data schemas (`Trajectory`, `Fact`, `PairFeature`, and the
 instance/interaction/video assertions) live in `smot/types.py`.
 
+The core package (`smot/` top level and `smot/datasets/`) stays
+stdlib-only; everything needing torch/transformers/opencv/PIL lives in
+`smot/ml/` and the dependency direction is strictly `smot.ml -> smot`.
+
 ## Stages
 
-- **Stage-0** (implemented here): pure deterministic pipeline — no learning
-  at all. Motion Fact Extractor + Event Candidate Filter run for real; the
-  Tracker and MLLM are stubs/mocks; Fact Selector/KFA/Projector are
+- **Stage-0** (done): pure deterministic pipeline — no learning at all.
+  Motion Fact Extractor + Event Candidate Filter run for real; the Tracker
+  and MLLM are stubs/mocks; Fact Selector/KFA/Projector are
   deterministic/no-op placeholders. This is the "打通" bootstrap milestone.
-- **Stage-1a** (future): swap in a learnable Unary KFA (appearance/action
-  slots + projector + soft-token injection).
-- **Stage-1b** (future): add a learnable Pairwise KFA (interaction slot) +
-  structured interaction JSON.
+- **Real inference** (done): `QwenMLLMAdapter` replaces the mock — frozen
+  Qwen3.5-2B consumes annotated key frames (per-track colored boxes +
+  color legend) and answers the interaction task in structured JSON.
+  BenSMOT GT trajectories stand in for the frozen tracker.
+- **Stage-1a** (done): `LearnableUnaryKFA` + `MLPProjector`, soft tokens
+  injected through an embedding forward hook (input_ids keep flowing
+  through the model so all internal multimodal fusion stays intact),
+  placed at the end of the user turn — before the assistant header.
+  `python -m smot.ml.training` teacher-forces all three tasks
+  through one shared CE loss (the exact same forward path the gate
+  verifies), z-scores fact embeds with dataset statistics carried inside
+  the checkpoint, and logs a per-step loss curve.
+- **Stage-1b** (done): `LearnablePairwiseKFA` (scores per-frame relative
+  geometry of a candidate edge; its hard top-k picks the interaction
+  evidence frames) + `LearnableFactSelector` (its soft attention readout
+  replaces fact mean-pooling; its hard top-k renders the transcript, so
+  the prompt text itself evolves with training). The projector input is
+  the `[fact | unary | pairwise]` slot layout — absent sources are
+  zero-filled, and the training-side (`torch.cat`) and inference-side
+  (`Pipeline._compose_pooled` + tail padding) compositions are locked to
+  the same contract by unit tests. Training candidate frames come from
+  the same `EventCandidateFilter` config inference uses (gold pairs the
+  filter misses fall back to common observed frames).
+  `python -m smot.ml.gradient_check` passes: loss backprops through the
+  frozen LM into exactly {unary KFA, pairwise KFA, fact selector,
+  projector}, 617 frozen tensors get no gradient.
+- **Stage-2** (future): visual-tower features appended to the KFA scoring
+  inputs (both KFAs only see an `in_dim` change), larger-scale training.
 
 `Pipeline`'s constructor takes every learnable/model-backed component as an
 optional argument defaulting to its Stage-0 implementation, so upgrading to
 Stage-1a/1b (or plugging in a real tracker/MLLM) requires no change to its
-call signature.
+call signature. The Stage-1 seams are already live in Stage-0: the KFA
+protocols accept per-frame visual features / `PairFeature` sequences (unused
+by the no-op defaults), and the projector's output is wired into
+`MLLMRequest.soft_tokens` — a real projector's tokens reach the MLLM adapter
+with no further plumbing.
+
+Every `PipelineResult` carries a `cost` report (`n_vlm_calls`,
+`n_key_frames`, `n_facts_selected`, `n_soft_tokens`) so the §7 cost metrics
+are measurable from day one.
 
 ## Stack
 
-Pure Python, standard library only (`dataclasses`, `typing.Protocol`,
-`unittest`) — no `torch`/`transformers` dependency yet. Those are introduced
-when real KFA/Projector slots need soft-token injection via `inputs_embeds`
-with backprop (Stage-1a/1b); see the `ml` extra in `pyproject.toml`.
+The core package is standard library only (`dataclasses`,
+`typing.Protocol`, `unittest`). The `smot/ml/` area needs the `ml` extra;
+torch must be a cu12x build covering both Blackwell (sm_120, RTX 50-series)
+and Ada Lovelace (sm_89, RTX 40-series / RTX 5880 Ada) — the cu128 wheels
+work for either:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh   # skip if uv is already installed
+uv venv --python 3.12 .venv
+uv pip install --python .venv torch torchvision --index-url https://download.pytorch.org/whl/cu128
+uv pip install --python .venv -e .[ml]
+```
+
+Qwen3.5-2B weights (~4 GB) download on first use; behind the GFW set
+`export HF_ENDPOINT=https://hf-mirror.com` first.
 
 ## Running
 
 ```bash
-# Install (editable) so `import smot` works from anywhere in the repo
-pip install -e .
-
-# Run the test suite
+# Stdlib-only: tests (ml tests auto-skip without torch) and the Stage-0 demo
 python -m unittest discover -s tests -v
-
-# Run the Stage-0 end-to-end demo on a synthetic two-object fixture
 python examples/run_stage0.py
+
+# BenSMOT workflow (download from https://github.com/HengLan/SMOT first):
+# 1. verify the annotation-format assumptions on one real sequence
+python -m smot.datasets.bensmot probe <BenSMOT>/test/<activity>/<seq>
+# 2. deterministic Mock baseline + SS7 eval (cost floor)
+python examples/run_bensmot_stage0.py <BenSMOT>/test --limit 20
+# 3. dataset-level fact statistics (Stage-1a norm_value normalization)
+python -m smot.datasets.bensmot stats <BenSMOT>/train -o fact_stats.json
+# 4. real frozen Qwen3.5 end-to-end (needs the ml venv)
+.venv/Scripts/python examples/run_bensmot_real.py <BenSMOT>/test --limit 5
+#    ... add --checkpoint stage1a.pt to inject trained Stage-1a components
+
+# Acceptance gate #1 (needs the ml venv + GPU): grads land exactly on the
+# four learnable slots, frozen MLLM untouched
+.venv/Scripts/python -m smot.ml.gradient_check
+
+# Stage-1b training (frozen Qwen3.5; trains {unary KFA, pairwise KFA,
+# fact selector, projector}, ~2.3M params; fits the 8 GB RTX 5060).
+# Then eval the checkpoint against the M-A2 baseline via
+# run_bensmot_real.py --checkpoint (1a/1b 格式自动判别).
+.venv/Scripts/python -m smot.ml.training <BenSMOT>/train --limit 120 \
+    --out-dir out/stage1b --epochs 2 --save-every 100 --skip-errors
+.venv/Scripts/python examples/run_bensmot_real.py <BenSMOT>/test --limit 8 \
+    --checkpoint out/stage1b/stage1b.pt
+
+# 长跑防杀:两个入口都支持 --resume(训练精确接续——样本顺序/RNG/优化器
+# 全恢复,与不中断一次跑逐位一致;评测逐序列增量写 pred.jsonl,续跑跳过
+# 已完成段)。训练还支持 --max-steps N 分段跑。
+
+# Evaluate any pred/gold payload pair (SS7: tiered interaction F1
+# strict / synonym-merged / coarse, direction accuracy, instance coverage,
+# cost aggregation). Both files hold a PipelineResult JSON or a list of them.
+python -m smot.eval pred.json gold.json
 ```

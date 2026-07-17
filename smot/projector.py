@@ -12,9 +12,11 @@ from typing import Protocol, runtime_checkable
 
 @runtime_checkable
 class Projector(Protocol):
-    """可学习。"""
+    """可学习。真实实现见 smot.ml.projector.MLPProjector。"""
 
-    def project(self, pooled_vector: tuple[float, ...]) -> tuple[tuple[float, ...], ...]: ...
+    def project(self, pooled_vector: tuple[float, ...]) -> tuple[tuple[float, ...], ...]:
+        """把一个池化向量映射成 m 个 soft token(每个 d_llm 维)。"""
+        ...
 
 
 class NoOpProjector:
@@ -23,4 +25,5 @@ class NoOpProjector:
     """
 
     def project(self, pooled_vector: tuple[float, ...]) -> tuple[tuple[float, ...], ...]:
+        # 返回空 tuple:Stage-0 的 prompt 完全靠文本 transcript,没有 soft token。
         return ()

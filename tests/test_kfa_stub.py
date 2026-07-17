@@ -45,6 +45,19 @@ class TestNoOpPairwiseKFA(unittest.TestCase):
         selection = self.kfa.select(self.candidate.edge, self.candidate, top_k=1)
         self.assertEqual(selection.key_frames, (3,))
 
+    def test_long_candidate_list_is_evenly_spaced_not_truncated(self):
+        # 候选帧多于 top_k 时应等间隔抽稀覆盖首尾,而不是截断成
+        # "全是事件开头的帧"。
+        candidate = EventCandidate(
+            edge=(1, 2),
+            candidate_frames=tuple(range(8)),
+            triggers=("contact",),
+        )
+        selection = self.kfa.select(candidate.edge, candidate, top_k=3)
+        self.assertEqual(len(selection.key_frames), 3)
+        self.assertIn(0, selection.key_frames)
+        self.assertIn(7, selection.key_frames)
+
     def test_soft_token_is_none(self):
         selection = self.kfa.select(self.candidate.edge, self.candidate, top_k=8)
         self.assertIsNone(selection.soft_token)
