@@ -9,8 +9,8 @@ dependencies = []
 dev = ["pytest"]
 # Introduced when real KFA/Projector/Fact-Selector slots need soft-token
 # injection via inputs_embeds (Stage-1a/1b, per design doc §9).
-# torch 需要 cu128 构建(RTX 50 系 Blackwell/sm_120):
-#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# torch 需要 cu128 构建(覆盖 Blackwell/sm_120 与 Ada Lovelace/sm_89):
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cu128
 ml = [
     "torch",
     "torchvision",  # Qwen3.5 的 processor(视频分支)依赖

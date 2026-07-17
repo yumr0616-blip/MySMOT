@@ -114,18 +114,19 @@ are measurable from day one.
 
 The core package is standard library only (`dataclasses`,
 `typing.Protocol`, `unittest`). The `smot/ml/` area needs the `ml` extra;
-on RTX 50-series (Blackwell / sm_120) torch must be the cu128 build:
+torch must be a cu12x build covering both Blackwell (sm_120, RTX 50-series)
+and Ada Lovelace (sm_89, RTX 40-series / RTX 5880 Ada) — the cu128 wheels
+work for either:
 
-```powershell
-python -m venv .venv
-.venv\Scripts\python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-.venv\Scripts\python -m pip install -e .[ml]
-# Windows 控制台中文输出乱码时:
-$env:PYTHONUTF8 = "1"
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh   # skip if uv is already installed
+uv venv --python 3.12 .venv
+uv pip install --python .venv torch torchvision --index-url https://download.pytorch.org/whl/cu128
+uv pip install --python .venv -e .[ml]
 ```
 
 Qwen3.5-2B weights (~4 GB) download on first use; behind the GFW set
-`$env:HF_ENDPOINT = "https://hf-mirror.com"` first.
+`export HF_ENDPOINT=https://hf-mirror.com` first.
 
 ## Running
 
