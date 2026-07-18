@@ -29,7 +29,7 @@ import torch
 from smot.ml.frames import FrameProvider, annotate_boxes, color_for_track, provider_for
 from smot.mllm import MLLMRequest
 
-DEFAULT_MODEL_ID = "Qwen/Qwen3.5-27B"
+DEFAULT_MODEL_ID = "Qwen/Qwen3.5-9B"
 
 # 三种任务附加在 transcript 之后的输出指令。interaction 要求结构化 JSON
 # (OutputAssembler 的结构化解析路径消费它;模型不守指令时 assembler 会
@@ -73,9 +73,14 @@ def load_frozen_qwen(
     if quantize_4bit:
         from transformers import BitsAndBytesConfig
 
-        # nf4 + bf16 计算精度:27B 权重 bf16 约 56GB,超出单卡 46GB;
-        # nf4 压到约 1/4(约 15-18GB),计算仍用 bf16,给训练侧的可学习
-        # 模块 + 激活值 + 桌面占用留出余量。
+        # 9B 权重 bf16 约 18GB,单卡 46GB 装得下不需要量化;这个开关
+        # 留作进一步压缩显存的选项(例如换更大底座,或与其他进程
+        # 共卡时)。注意:qwen3_5 的 linear_attention 层在缺少
+        # flash-linear-attention + causal-conv1d 融合核时走朴素
+        # PyTorch 回退实现,反传时的激活值显存远超权重体积本身
+        # 暗示的量级——27B 曾在这个回退路径下于 640px/top-k2 的
+        # 最紧预算 + grad-checkpoint 下仍 OOM(见 P2-0 提交记录),
+        # 这才是换回 9B 的原因,不是显存不够装权重。
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
@@ -286,7 +291,7 @@ class QwenMLLMAdapter:
     """实现 smot.mllm.MLLMAdapter Protocol 的真实(冻结)多模态适配器。
 
     model/processor 可以直接注入(与训练循环共享同一份权重,避免同一张
-    卡上放两份 27B 权重——nf4 下单份约 15-18GB,两份会挤掉训练侧激活值
+    卡上放两份 9B 权重——bf16 下单份约 18GB,两份会挤掉训练侧激活值
     的余量),不注入时按 model_id 自行加载。
     """
 

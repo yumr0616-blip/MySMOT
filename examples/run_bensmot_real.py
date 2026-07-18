@@ -10,7 +10,7 @@ Mock 地板的提升"与"学习后相对确定性选择的提升"两条对照的
 
 用法:
     python examples/run_bensmot_real.py <BenSMOT根目录或子目录> \
-        [--limit N] [--out-dir out/bensmot_real] [--model-id Qwen/Qwen3.5-27B] \
+        [--limit N] [--out-dir out/bensmot_real] [--model-id Qwen/Qwen3.5-9B] \
         [--quantize-4bit] [--checkpoint stage1b.pt] [--skip-errors]
 
 需要 ml 依赖(venv + torch cu128 + transformers,见 README)。

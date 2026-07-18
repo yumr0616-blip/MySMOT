@@ -233,7 +233,7 @@ class _FrameRenderer:
     留够余量,但仍不用默认的 32,避免上百个序列同时挂着时 RAM 堆积。
     JPEG 重复解码只是毫秒级,命不中就重解码。"""
 
-    def __init__(self, max_side: int = 1024):
+    def __init__(self, max_side: int = 800):
         self._providers: dict[str, Optional[ImageDirFrameProvider]] = {}
         self._max_side = max_side
 
@@ -669,7 +669,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--fact-top-k", type=int, default=6,
         help="fact selector 每步选进 transcript 的事实条数",
     )
-    parser.add_argument("--image-max-side", type=int, default=1024)
+    parser.add_argument(
+        "--image-max-side", type=int, default=800,
+        help="1024 会在 linear_attn 反传时 OOM(见 qwen_adapter 顶部注释"
+             "的 P2-0 记录);800 是 B-gate 探针验证过的上限,配合"
+             "--grad-checkpoint 使用",
+    )
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument(
         "--save-every", type=int, default=100,

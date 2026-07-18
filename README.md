@@ -26,8 +26,9 @@ video
 Frozen (never trained): tracker, MLLM body, MLLM vision tower.
 Learnable (implemented in `smot/ml/`): Stage-1a's unary KFA slot and the
 KFA/Fact -> MLLM projector, plus Stage-1b's pairwise KFA and Fact
-Selector slots — four small modules (~2.3M params total) trained jointly
-against the frozen MLLM.
+Selector slots — four small modules (~4.4M params total with the
+Qwen3.5-9B backbone's d_llm=4096; scales with the backbone's embedding
+dim) trained jointly against the frozen MLLM.
 Deterministic (implemented for real): motion fact geometric extraction,
 event candidate filtering, output assembly.
 
@@ -69,7 +70,7 @@ stdlib-only; everything needing torch/transformers/opencv/PIL lives in
   and MLLM are stubs/mocks; Fact Selector/KFA/Projector are
   deterministic/no-op placeholders. This is the "打通" bootstrap milestone.
 - **Real inference** (done): `QwenMLLMAdapter` replaces the mock — frozen
-  Qwen3.5-2B consumes annotated key frames (per-track colored boxes +
+  Qwen3.5-9B consumes annotated key frames (per-track colored boxes +
   color legend) and answers the interaction task in structured JSON.
   BenSMOT GT trajectories stand in for the frozen tracker.
 - **Stage-1a** (done): `LearnableUnaryKFA` + `MLPProjector`, soft tokens
@@ -125,8 +126,13 @@ uv pip install --python .venv torch torchvision --index-url https://download.pyt
 uv pip install --python .venv -e .[ml]
 ```
 
-Qwen3.5-2B weights (~4 GB) download on first use; behind the GFW set
-`export HF_ENDPOINT=https://hf-mirror.com` first.
+Qwen3.5-9B weights (~18 GB bf16, no quantization needed on 46GB-class
+cards) download on first use; behind the GFW set
+`export HF_ENDPOINT=https://hf-mirror.com` first. If `huggingface_hub`
+pulls in the `hf_xet` package, large downloads through some HTTP/SOCKS
+proxies can crawl at ~100KB/s instead of full proxy bandwidth — set
+`HF_HUB_DISABLE_XET=1` to force the plain-HTTP downloader if a download
+looks stuck.
 
 ## Running
 
@@ -143,20 +149,29 @@ python examples/run_bensmot_stage0.py <BenSMOT>/test --limit 20
 # 3. dataset-level fact statistics (Stage-1a norm_value normalization)
 python -m smot.datasets.bensmot stats <BenSMOT>/train -o fact_stats.json
 # 4. real frozen Qwen3.5 end-to-end (needs the ml venv)
-.venv/Scripts/python examples/run_bensmot_real.py <BenSMOT>/test --limit 5
+.venv/bin/python examples/run_bensmot_real.py <BenSMOT>/test --limit 5
 #    ... add --checkpoint stage1a.pt to inject trained Stage-1a components
 
 # Acceptance gate #1 (needs the ml venv + GPU): grads land exactly on the
 # four learnable slots, frozen MLLM untouched
-.venv/Scripts/python -m smot.ml.gradient_check
+.venv/bin/python -m smot.ml.gradient_check
 
-# Stage-1b training (frozen Qwen3.5; trains {unary KFA, pairwise KFA,
-# fact selector, projector}, ~2.3M params; fits the 8 GB RTX 5060).
+# Stage-1b training (frozen Qwen3.5-9B bf16; trains {unary KFA, pairwise
+# KFA, fact selector, projector}, ~4.4M params). --quantize-4bit isn't
+# needed for 9B on a 46GB-class card, but --grad-checkpoint is worth
+# keeping on: the qwen3_5 linear-attention layers fall back to an
+# unfused torch implementation without flash-linear-attention +
+# causal-conv1d installed, and that fallback's backward pass is what
+# actually pushes VRAM close to the ceiling at this scale, not raw
+# weight size (see qwen_adapter.py's quantize_4bit docstring). 800px
+# is the largest --image-max-side that fit at top-k-frames=4 in the
+# B-gate throughput probe; 1024px OOMs even with --grad-checkpoint.
 # Then eval the checkpoint against the M-A2 baseline via
 # run_bensmot_real.py --checkpoint (1a/1b 格式自动判别).
-.venv/Scripts/python -m smot.ml.training <BenSMOT>/train --limit 120 \
-    --out-dir out/stage1b --epochs 2 --save-every 100 --skip-errors
-.venv/Scripts/python examples/run_bensmot_real.py <BenSMOT>/test --limit 8 \
+.venv/bin/python -m smot.ml.training <BenSMOT>/train --limit 120 \
+    --out-dir out/stage1b --epochs 2 --save-every 100 --skip-errors \
+    --grad-checkpoint
+.venv/bin/python examples/run_bensmot_real.py <BenSMOT>/test --limit 8 \
     --checkpoint out/stage1b/stage1b.pt
 
 # 长跑防杀:两个入口都支持 --resume(训练精确接续——样本顺序/RNG/优化器
