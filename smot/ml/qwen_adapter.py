@@ -135,10 +135,16 @@ def teacher_forced_loss(model, processor, messages, soft_tokens, target_text: st
     # add_generation_prompt=True:模板末尾补上 "<|im_start|>assistant\n"
     # 这类生成头,使得后面拼接的 target_ids 恰好接在"该模型开始说话"的
     # 位置——这正是教师强制训练要构造的输入形状。
+    # enable_thinking=False:不然模板会在生成头后面留一个未闭合的
+    # "<think>\n"(qwen3_5 的模板默认预期模型自己写推理过程再闭合),
+    # target_ids 就被接在"思考中"的语境里而不是"思考已结束、正式作答"
+    # 的语境里——这与 generate() 侧必须同构(下面 enable_thinking 的
+    # 注释有完整解释)。
     inputs = processor.apply_chat_template(
         messages,
         tokenize=True,
         add_generation_prompt=True,
+        enable_thinking=False,
         return_dict=True,
         return_tensors="pt",
     ).to(device)
@@ -327,10 +333,17 @@ class QwenMLLMAdapter:
         content.append({"type": "text", "text": text})
         messages = [{"role": "user", "content": content}]
 
+        # enable_thinking=False:qwen3_5 的模板默认在生成头后留一个未闭合
+        # 的 "<think>\n",指望模型自己写一段推理再 </think> 收尾才作答;
+        # 96 个 token 的生成预算根本不够写完这段推理,发现时 9B 的每条
+        # 输出都卡在思考文本里、结构化 JSON 从没出现过(100 段评测 F1
+        # 恒为 0,连最宽松的 coarse 口径都没有一条匹配)。显式关闭后模板
+        # 直接吐 "<think>\n\n</think>\n\n",模型从干净的作答语境起步。
         inputs = self._processor.apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=True,
+            enable_thinking=False,
             return_dict=True,
             return_tensors="pt",
         ).to(self._model.device)
