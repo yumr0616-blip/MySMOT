@@ -228,12 +228,12 @@ class _FrameRenderer:
     """按序列缓存帧提供者;imgs 目录缺失时静默退化为纯文本样本
     (合成 fixture 没有图像,真实 BenSMOT 一定有)。
 
-    每个提供者的帧 LRU 压到 2:样本是跨序列 shuffle 的,帧缓存命中率
-    本来就低,而全尺寸解码帧很大(1080p RGB ≈ 6MB/帧)——默认 32 帧
-    × 上百个序列曾把训练进程 RAM 吹到数 GB。JPEG 重复解码只是毫秒级,
-    宁可重解码。"""
+    每个提供者的帧 LRU 给到 8:样本是跨序列 shuffle 的,帧缓存命中率
+    本来就低,而全尺寸解码帧不小(1080p RGB ≈ 6MB/帧)——48GB 机器上
+    留够余量,但仍不用默认的 32,避免上百个序列同时挂着时 RAM 堆积。
+    JPEG 重复解码只是毫秒级,命不中就重解码。"""
 
-    def __init__(self, max_side: int = 640):
+    def __init__(self, max_side: int = 1024):
         self._providers: dict[str, Optional[ImageDirFrameProvider]] = {}
         self._max_side = max_side
 
@@ -242,7 +242,7 @@ class _FrameRenderer:
         if provider is _MISSING:
             imgs_dir = Path(seq.seq_dir) / "imgs"
             provider = (
-                ImageDirFrameProvider(imgs_dir, cache_size=2)
+                ImageDirFrameProvider(imgs_dir, cache_size=8)
                 if imgs_dir.is_dir()
                 else None
             )
@@ -512,7 +512,7 @@ def train(args) -> dict:
                         continue
             with open(log_path, "w", encoding="utf-8") as f:
                 f.writelines(kept)
-    empty_cache_every = 20  # 周期清空 CUDA 缓存分配器,缓解变长样本的碎片化
+    empty_cache_every = 100  # 周期清空 CUDA 缓存分配器,缓解变长样本的碎片化
 
     def save(
         epoch: int,
@@ -604,10 +604,10 @@ def train(args) -> dict:
                     )
                     + "\n"
                 )
-                # 变长多模态样本在 8GB 卡上会让缓存分配器逐步碎片化,
-                # 顶到显存上限后 WDDM 把溢出页搬到系统内存,单步会从
-                # 秒级劣化到分钟级(实测停摆)——周期性清空缓存换一点
-                # 重分配开销,保持峰值远离天花板。
+                # 变长多模态样本会让缓存分配器逐步碎片化;48GB 卡上
+                # 余量大,不再是每步都清的硬约束,但长跑(数千步)仍
+                # 值得周期性清一次,换一点重分配开销避免碎片累积到
+                # 顶到显存上限。
                 if step % empty_cache_every == 0 and device.startswith("cuda"):
                     torch.cuda.empty_cache()
                 if step % args.log_every == 0:
@@ -658,18 +658,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--clip-norm", type=float, default=1.0)
     parser.add_argument("--n-tokens", type=int, default=4, help="soft token 数 m")
     parser.add_argument(
-        "--top-k-frames", type=int, default=2,
-        help="instance 任务每步送入 MLLM 的关键帧数(训练时从紧,控显存)",
+        "--top-k-frames", type=int, default=4,
+        help="instance 任务每步送入 MLLM 的关键帧数(与推理侧 PipelineConfig 同预算)",
     )
     parser.add_argument(
-        "--top-k-pair-frames", type=int, default=2,
+        "--top-k-pair-frames", type=int, default=4,
         help="interaction 任务每步送入 MLLM 的关键帧数(pairwise KFA hard 选帧)",
     )
     parser.add_argument(
         "--fact-top-k", type=int, default=6,
         help="fact selector 每步选进 transcript 的事实条数",
     )
-    parser.add_argument("--image-max-side", type=int, default=640)
+    parser.add_argument("--image-max-side", type=int, default=1024)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument(
         "--save-every", type=int, default=100,

@@ -10,7 +10,7 @@ Mock 地板的提升"与"学习后相对确定性选择的提升"两条对照的
 
 用法:
     python examples/run_bensmot_real.py <BenSMOT根目录或子目录> \
-        [--limit N] [--out-dir out/bensmot_real] [--model-id Qwen/Qwen3.5-2B] \
+        [--limit N] [--out-dir out/bensmot_real] [--model-id Qwen/Qwen3.5-27B] \
         [--quantize-4bit] [--checkpoint stage1b.pt] [--skip-errors]
 
 需要 ml 依赖(venv + torch cu128 + transformers,见 README)。
@@ -43,7 +43,10 @@ def main() -> int:
     parser.add_argument("root", help="BenSMOT 根目录(或任意包含序列的子目录)")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--out-dir", default=os.path.join("out", "bensmot_real"))
-    parser.add_argument("--model-id", default="Qwen/Qwen3.5-2B")
+    parser.add_argument(
+        "--model-id", default=None,
+        help="默认取 smot.ml.qwen_adapter.DEFAULT_MODEL_ID",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=96)
     parser.add_argument("--quantize-4bit", action="store_true")
     parser.add_argument(
@@ -70,10 +73,10 @@ def main() -> int:
         return 1
 
     # 重依赖 import 放在参数解析之后:--help 不需要 torch。
-    from smot.ml.qwen_adapter import QwenMLLMAdapter
+    from smot.ml.qwen_adapter import DEFAULT_MODEL_ID, QwenMLLMAdapter
 
     adapter = QwenMLLMAdapter(
-        model_id=args.model_id,
+        model_id=args.model_id or DEFAULT_MODEL_ID,
         max_new_tokens=args.max_new_tokens,
         quantize_4bit=args.quantize_4bit,
     )

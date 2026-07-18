@@ -29,7 +29,7 @@ import torch
 from smot.ml.frames import FrameProvider, annotate_boxes, color_for_track, provider_for
 from smot.mllm import MLLMRequest
 
-DEFAULT_MODEL_ID = "Qwen/Qwen3.5-2B"
+DEFAULT_MODEL_ID = "Qwen/Qwen3.5-27B"
 
 # 三种任务附加在 transcript 之后的输出指令。interaction 要求结构化 JSON
 # (OutputAssembler 的结构化解析路径消费它;模型不守指令时 assembler 会
@@ -73,9 +73,9 @@ def load_frozen_qwen(
     if quantize_4bit:
         from transformers import BitsAndBytesConfig
 
-        # nf4 + bf16 计算精度:在 8GB 级显卡上把权重显存压到约 1/4,
-        # 计算仍用 bf16(精度换算开销可接受),否则整卡装不下 2B 模型
-        # 加上训练侧的可学习模块 + 激活值。
+        # nf4 + bf16 计算精度:27B 权重 bf16 约 56GB,超出单卡 46GB;
+        # nf4 压到约 1/4(约 15-18GB),计算仍用 bf16,给训练侧的可学习
+        # 模块 + 激活值 + 桌面占用留出余量。
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
@@ -285,8 +285,9 @@ def soft_token_injection(model, soft: Optional[torch.Tensor], start_pos: int):
 class QwenMLLMAdapter:
     """实现 smot.mllm.MLLMAdapter Protocol 的真实(冻结)多模态适配器。
 
-    model/processor 可以直接注入(与训练循环共享同一份权重,避免 8GB
-    显存里放两份模型),不注入时按 model_id 自行加载。
+    model/processor 可以直接注入(与训练循环共享同一份权重,避免同一张
+    卡上放两份 27B 权重——nf4 下单份约 15-18GB,两份会挤掉训练侧激活值
+    的余量),不注入时按 model_id 自行加载。
     """
 
     def __init__(
