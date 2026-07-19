@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -55,6 +56,12 @@ def main() -> int:
         help="训练好的 checkpoint(1a/1b 格式自动判别,注入对应可学习组件)",
     )
     parser.add_argument("--skip-errors", action="store_true")
+    parser.add_argument(
+        "--feat-cache-dir", default=None,
+        help="P2 Stage-2:smot.ml.feature_cache 离线视觉特征缓存目录"
+             "(如 out/feat_cache);split 从 root 路径末段推断("
+             "train/test),须与训练该 checkpoint 时一致",
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -119,11 +126,24 @@ def main() -> int:
     jsonl_file = open(  # noqa: SIM115 - 生命周期跨整个循环,结束处显式关闭
         jsonl_path, "a" if args.resume else "w", encoding="utf-8", buffering=1
     )
+    feat_cache_split = Path(args.root).name if args.feat_cache_dir else None
     for seq in sequences:
         if seq.name in done:
             continue
         t_max = max(traj.present[1] for traj in seq.trajectories)
         trajectories = list(seq.trajectories)
+        vis_cache = None
+        if args.feat_cache_dir is not None:
+            from smot.ml.feature_cache import NearestFillCache, cache_path, load_cache
+
+            vis_cache = NearestFillCache(
+                load_cache(cache_path(args.feat_cache_dir, feat_cache_split, seq.name))
+            )
+            if not vis_cache:
+                print(
+                    f"[视觉缓存缺失] {seq.name}: 视觉分量将全零(未离线预提?)",
+                    file=sys.stderr,
+                )
         pipeline_kwargs: dict = {
             "tracker": StubTracker(trajectories),
             "mllm_adapter": adapter,
@@ -135,28 +155,48 @@ def main() -> int:
             ),
         }
         if loaded is not None:  # 只有传了 --checkpoint 才用可学习组件,否则维持 Stage-0 NoOp 默认值
+            if vis_cache is not None:
+                from smot.ml.feature_cache import augmented_frame_features
+
+                # 用默认参数把 _tm/_vc 冻结进闭包,理由同 t_max(经典的
+                # Python 闭包晚绑定问题):循环变量直接引用的话,所有
+                # lambda 到调用时都会看到最后一次迭代的值。
+                frame_feature_fn = (
+                    lambda traj, _tm=t_max, _vc=vis_cache: augmented_frame_features(
+                        traj, _vc, t_max=_tm
+                    )
+                )
+            else:
+                frame_feature_fn = lambda traj, _tm=t_max: geometric_frame_features(
+                    traj, t_max=_tm
+                )
             pipeline_kwargs.update(
                 unary_kfa=loaded.unary_kfa,
                 projector=loaded.projector,
-                # 逐帧特征的时间归一化用本序列的全局最大帧号。
-                # 用默认参数 _tm=t_max 把当前循环变量的值"冻结"进闭包——
-                # 直接引用外层 t_max 会有经典的 Python 闭包晚绑定问题
-                # (循环结束后所有 lambda 都会看到同一个、最后一次迭代的 t_max)。
-                frame_feature_fn=lambda traj, _tm=t_max: geometric_frame_features(
-                    traj, t_max=_tm
-                ),
+                frame_feature_fn=frame_feature_fn,
                 fact_transform=fact_transform,
             )
             if loaded.pairwise_kfa is not None:
-                # Stage-1b 组件:可学习 pairwise KFA + fact selector,以及
-                # pairwise 打分需要的向量化特征接缝(时间归一化同样按本
-                # 序列的 t_max 冻结进闭包,与训练侧 build_examples 一致)。
+                # Stage-1b/Stage-2 组件:可学习 pairwise KFA + fact
+                # selector,以及 pairwise 打分需要的向量化特征接缝(时间
+                # 归一化同样按本序列的 t_max 冻结进闭包,与训练侧
+                # build_examples 一致)。
+                if vis_cache is not None:
+                    from smot.ml.feature_cache import augmented_pair_feature_vectors
+
+                    pair_feature_fn = (
+                        lambda pfs, _tm=t_max, _vc=vis_cache: augmented_pair_feature_vectors(
+                            pfs, _vc, t_max=_tm
+                        )
+                    )
+                else:
+                    pair_feature_fn = lambda pfs, _tm=t_max: pair_feature_vectors(
+                        pfs, t_max=_tm
+                    )
                 pipeline_kwargs.update(
                     pairwise_kfa=loaded.pairwise_kfa,
                     fact_selector=loaded.fact_selector,
-                    pair_feature_fn=lambda pfs, _tm=t_max: pair_feature_vectors(
-                        pfs, t_max=_tm
-                    ),
+                    pair_feature_fn=pair_feature_fn,
                 )
         pipeline = Pipeline(**pipeline_kwargs)
         result = pipeline.run(sequence_to_video_handle(seq))

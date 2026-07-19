@@ -110,13 +110,42 @@ class _Example:
 def build_examples(
     sequences: list[BenSMOTSequence],
     fact_stats: dict,
+    feat_cache_dir: Optional[str] = None,
 ) -> list[_Example]:
-    """把转换后的序列展开成三类训练样本(gold 文本缺失的条目跳过)。"""
+    """把转换后的序列展开成三类训练样本(gold 文本缺失的条目跳过)。
+
+    feat_cache_dir 给定时(P2 Stage-2):每条序列按 smot.ml.feature_cache
+    的离线视觉塔缓存查最近邻,几何特征拼上视觉分量再喂给 KFA(维度从
+    FRAME_FEATURE_DIM/PAIR_FEATURE_DIM 变成 AUGMENTED_*);不给时保持
+    Stage-1a/1b 纯几何行为不变。缓存按 "train" split 组织(训练脚本
+    只用得到训练集)。某条序列没有缓存文件(未离线预提或该序列无图像)
+    时退化为全零视觉分量而不是报错——与 augmented_frame_features/
+    augmented_pair_feature_vectors 本身"缺失即补零"的设计一致,但会打
+    印一次性警告,避免"以为用上了视觉特征其实全零"这种错误无声无息。
+    """
     extractor = MotionFactExtractor()
     normalize = make_fact_embed_normalizer(fact_stats)
     examples: list[_Example] = []
 
     for seq in sequences:
+        vis_cache = None
+        if feat_cache_dir is not None:
+            from smot.ml.feature_cache import (
+                NearestFillCache,
+                augmented_frame_features,
+                augmented_pair_feature_vectors,
+                cache_path,
+                load_cache,
+            )
+
+            vis_cache = NearestFillCache(
+                load_cache(cache_path(feat_cache_dir, "train", seq.name))
+            )
+            if not vis_cache:
+                print(
+                    f"[视觉缓存缺失] {seq.name}: 视觉分量将全零(未离线预提?)",
+                    file=sys.stderr,
+                )
         trajectories = list(seq.trajectories)
         facts = normalize(extractor.extract(trajectories))
         t_max = max(traj.present[1] for traj in trajectories)
@@ -153,7 +182,11 @@ def build_examples(
                     fact_texts=texts,
                     fact_priorities=priors,
                     track_id=traj.track_id,
-                    features=geometric_frame_features(traj, t_max=t_max),
+                    features=(
+                        augmented_frame_features(traj, vis_cache, t_max=t_max)
+                        if vis_cache is not None
+                        else geometric_frame_features(traj, t_max=t_max)
+                    ),
                 )
             )
 
@@ -200,7 +233,11 @@ def build_examples(
                     fact_feats=feats,
                     fact_texts=texts,
                     fact_priorities=priors,
-                    pair_feats=pair_feature_vectors(pfs, t_max=t_max),
+                    pair_feats=(
+                        augmented_pair_feature_vectors(pfs, vis_cache, t_max=t_max)
+                        if vis_cache is not None
+                        else pair_feature_vectors(pfs, t_max=t_max)
+                    ),
                     pair_ts=tuple(pf.t for pf in pfs),
                     box_track_ids=(lo, hi),
                 )
@@ -397,7 +434,7 @@ def train(args) -> dict:
 
     # fact 统计量从训练序列上算(推理侧经 checkpoint 取回同一份)。
     fact_stats = compute_fact_statistics(sequences)
-    examples = build_examples(sequences, fact_stats)
+    examples = build_examples(sequences, fact_stats, feat_cache_dir=args.feat_cache_dir)
     if not examples:
         raise SystemExit("没有可训练样本(gold 文本全部缺失?)")
     task_counts = {
@@ -447,8 +484,17 @@ def train(args) -> dict:
             f" epoch 内第 {resume_state['index_in_epoch']} 条)继续", file=sys.stderr,
         )
     else:
-        unary_kfa = LearnableUnaryKFA().to(device)
-        pairwise_kfa = LearnablePairwiseKFA().to(device)
+        if args.feat_cache_dir is not None:
+            from smot.ml.feature_cache import (
+                AUGMENTED_FRAME_FEATURE_DIM,
+                AUGMENTED_PAIR_FEATURE_DIM,
+            )
+
+            unary_kfa = LearnableUnaryKFA(in_dim=AUGMENTED_FRAME_FEATURE_DIM).to(device)
+            pairwise_kfa = LearnablePairwiseKFA(in_dim=AUGMENTED_PAIR_FEATURE_DIM).to(device)
+        else:
+            unary_kfa = LearnableUnaryKFA().to(device)
+            pairwise_kfa = LearnablePairwiseKFA().to(device)
         fact_selector = LearnableFactSelector().to(device)
         projector = MLPProjector(
             # [fact | unary | pairwise] 槽位布局(与 Pipeline._compose_pooled
@@ -653,6 +699,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("root", help="BenSMOT 根目录(或任意包含序列的子目录)")
     parser.add_argument("--out-dir", default="out/stage1b")
     parser.add_argument("--limit", type=int, default=None, help="最多加载的序列数")
+    parser.add_argument(
+        "--feat-cache-dir", default=None,
+        help="P2 Stage-2:smot.ml.feature_cache 离线视觉特征缓存目录"
+             "(如 out/feat_cache);不给则是 Stage-1a/1b 纯几何行为",
+    )
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--clip-norm", type=float, default=1.0)

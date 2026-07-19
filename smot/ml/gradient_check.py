@@ -69,8 +69,18 @@ def run_gradient_check(
     n_frames: int = 8,
     top_k: int = 4,
     seed: int = 0,
+    unary_in_dim: int = FRAME_FEATURE_DIM,
+    pairwise_in_dim: int = PAIR_FEATURE_DIM,
 ) -> dict:
-    """执行一次门禁检查,返回结构化报告(report["pass"] 为总判定)。"""
+    """执行一次门禁检查,返回结构化报告(report["pass"] 为总判定)。
+
+    unary_in_dim/pairwise_in_dim 默认是纯几何维度(Stage-1a/1b);传
+    smot.ml.feature_cache.AUGMENTED_FRAME_FEATURE_DIM/
+    AUGMENTED_PAIR_FEATURE_DIM 即可复用同一套门禁检查 P2 Stage-2 的
+    放大 in_dim——门禁只关心梯度是否流向四个可训练槽位、冻结 MLLM 是否
+    纹丝不动,不关心特征本身是几何还是几何+视觉,所以这里用合成随机
+    张量,不需要真实的离线视觉缓存。
+    """
     torch.manual_seed(seed)
     embedding = model.get_input_embeddings()
     d_llm = embedding.embedding_dim
@@ -78,8 +88,8 @@ def run_gradient_check(
     # 的模块 docstring)。
     embed_rms = float(embedding.weight.detach().float().pow(2).mean().sqrt())
 
-    unary_kfa = LearnableUnaryKFA().to(device)
-    pairwise_kfa = LearnablePairwiseKFA().to(device)
+    unary_kfa = LearnableUnaryKFA(in_dim=unary_in_dim).to(device)
+    pairwise_kfa = LearnablePairwiseKFA(in_dim=pairwise_in_dim).to(device)
     fact_selector = LearnableFactSelector().to(device)
     projector = MLPProjector(
         # 与训练循环同一份 [fact | unary | pairwise] 槽位布局。
@@ -113,7 +123,7 @@ def run_gradient_check(
     # ---- instance 样本:fact selector + unary KFA 两条 soft 通路 ----
     fact_feats = torch.rand(5, FACT_SCORE_DIM, device=device)
     _hard_f, soft_facts = fact_selector(fact_feats, top_k=3)
-    unary_feats = torch.rand(n_frames, FRAME_FEATURE_DIM, device=device)
+    unary_feats = torch.rand(n_frames, unary_in_dim, device=device)
     _hard_u, soft_unary = unary_kfa(unary_feats, top_k=top_k)
     inst_tokens = projector(
         torch.cat([soft_facts, soft_unary, zeros_pair])
@@ -125,7 +135,7 @@ def run_gradient_check(
     # ---- interaction 样本:fact selector + pairwise KFA 两条 soft 通路 ----
     fact_feats2 = torch.rand(4, FACT_SCORE_DIM, device=device)
     _hard_f2, soft_facts2 = fact_selector(fact_feats2, top_k=3)
-    pair_feats = torch.rand(6, PAIR_FEATURE_DIM, device=device)
+    pair_feats = torch.rand(6, pairwise_in_dim, device=device)
     _hard_p, soft_pair = pairwise_kfa(pair_feats, top_k=2)
     inter_tokens = projector(
         torch.cat([soft_facts2, zeros_unary, soft_pair])
@@ -204,12 +214,31 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--quantize-4bit", action="store_true")
+    parser.add_argument(
+        "--stage2", action="store_true",
+        help="用 P2 Stage-2 的放大 in_dim(几何+视觉)构造 KFA,而不是"
+             "Stage-1a/1b 的纯几何维度",
+    )
     args = parser.parse_args(argv)
 
     model, processor = load_frozen_qwen(
         args.model_id, device=args.device, quantize_4bit=args.quantize_4bit
     )
-    report = run_gradient_check(model, processor, device=args.device)
+    if args.stage2:
+        from smot.ml.feature_cache import (
+            AUGMENTED_FRAME_FEATURE_DIM,
+            AUGMENTED_PAIR_FEATURE_DIM,
+        )
+
+        report = run_gradient_check(
+            model,
+            processor,
+            device=args.device,
+            unary_in_dim=AUGMENTED_FRAME_FEATURE_DIM,
+            pairwise_in_dim=AUGMENTED_PAIR_FEATURE_DIM,
+        )
+    else:
+        report = run_gradient_check(model, processor, device=args.device)
 
     print(f"loss = {report['loss']:.4f}")
     for module_name, norm in report["trainable_grad_norms"].items():
