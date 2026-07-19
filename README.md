@@ -94,7 +94,8 @@ stdlib-only; everything needing torch/transformers/opencv/PIL lives in
   filter misses fall back to common observed frames).
   `python -m smot.ml.gradient_check` passes: loss backprops through the
   frozen LM into exactly {unary KFA, pairwise KFA, fact selector,
-  projector}, 617 frozen tensors get no gradient.
+  projector}, 760 frozen tensors get no gradient (Qwen3.5-9B; was 617
+  on the earlier Qwen3.5-2B backbone).
 - **Stage-2** (future): visual-tower features appended to the KFA scoring
   inputs (both KFAs only see an `in_dim` change), larger-scale training.
 
